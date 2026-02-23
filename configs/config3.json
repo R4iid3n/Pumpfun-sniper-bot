@@ -1,0 +1,48 @@
+{
+  "_name": "config3 — min_avg_buy raised 0.06 → 0.07",
+  "_date": "2026-02-23",
+  "_notes": [
+    "All config2 changes carried forward",
+    "min_avg_buy floor raised: 0.06 → 0.07 SOL (blocks CITY: 8 buys at 0.061 avg -6.5%)",
+    "Projected session avg: ~+9% vs config1 +5.4% / config2 +8%",
+    "Tradeoff: also blocks tokens like 69420 (avg=0.069, +10.4%) — watch NEAR_MISS logs"
+  ],
+
+  "maxPositionSize": 0.05,
+  "trailingStop": 5,
+  "trailingTakeProfit": 15,
+  "momentumStaleSeconds": 7,
+  "latencySlippagePct": 2,
+  "minLiquidity": 3,
+  "maxDevHolding": 12,
+  "maxTopHolder": 25,
+  "minBurnerHolderPct": 8.0,
+  "burnerTxThreshold": 5,
+  "minBurnersToBlock": 3,
+  "autoTrade": true,
+  "maxOpenPositions": 1,
+  "useMartingale": false,
+  "useSoftMartingale": false,
+  "martingaleMultiplier": 2.0,
+  "maxMartingaleLevel": 3,
+  "earlyDumpDetection": true,
+  "earlyDumpThreshold": -7,
+  "earlyDumpWindow": 15,
+  "noBuysExit": true,
+  "noBuysWindow": 3,
+  "useTwitterSentiment": false,
+
+  "_entry_filters": {
+    "price_gain_min_pct": 3,
+    "price_gain_max_pct": 7,
+    "min_buy_count": 1,
+    "min_sol_volume": 0.4,
+    "avg_buy_sol_min": 0.07,
+    "avg_buy_sol_max": 0.50,
+    "max_single_buy_sol": 0.65,
+    "max_sell_drop_pct": 1.5,
+    "breakeven_floor_pct": 3,
+    "min_age_s": 1.5,
+    "max_age_s": 15
+  }
+}

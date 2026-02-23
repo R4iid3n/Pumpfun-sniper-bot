@@ -1,0 +1,38 @@
+{
+  "_name": "config1 — post-BUY_GATE removal, sell_dump filter active",
+  "_date": "2026-02-23",
+  "_notes": [
+    "BUY_GATE removed (dev/top/burner RPC checks always returned 0% on fresh mints)",
+    "sell_dump<1.5% entry filter added to block pre-entry whale dumps",
+    "avg_buy loosened 0.20 → 0.50 SOL to match single-whale market conditions",
+    "Error 6000 treated as slippage (not BC-not-ready): slippage raised, retried in 0.1s",
+    "Max error-6000 retries: 3 (was 8)",
+    "Initial slippage: 25% (was 10%)",
+    "Entry age window: 1.5–15s (was 3–15s)",
+    "avg +4,5%"
+  ],
+
+  "maxPositionSize": 0.05,
+  "trailingStop": 5,
+  "trailingTakeProfit": 15,
+  "momentumStaleSeconds": 7,
+  "latencySlippagePct": 2,
+  "minLiquidity": 3,
+  "maxDevHolding": 12,
+  "maxTopHolder": 25,
+  "minBurnerHolderPct": 8.0,
+  "burnerTxThreshold": 5,
+  "minBurnersToBlock": 3,
+  "autoTrade": true,
+  "maxOpenPositions": 1,
+  "useMartingale": false,
+  "useSoftMartingale": false,
+  "martingaleMultiplier": 2.0,
+  "maxMartingaleLevel": 3,
+  "earlyDumpDetection": true,
+  "earlyDumpThreshold": -7,
+  "earlyDumpWindow": 15,
+  "noBuysExit": true,
+  "noBuysWindow": 3,
+  "useTwitterSentiment": false
+}
