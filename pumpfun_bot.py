@@ -35,8 +35,23 @@ from typing import Dict, List
 import time
 import requests
 from solana.rpc.api import Client
+from solana.rpc.commitment import Processed
 from solders.pubkey import Pubkey
+from spl.token.instructions import get_associated_token_address
 import struct
+# Direct file logger — flushes every line (Windows buffers logging.FileHandler)
+_debug_file = open('live_debug.log', 'w', encoding='utf-8')
+
+class _DebugLog:
+    def info(self, msg):
+        _debug_file.write(f"{datetime.now().strftime('%H:%M:%S')} {msg}\n")
+        _debug_file.flush()
+    def debug(self, msg):
+        self.info(msg)
+    def warning(self, msg):
+        self.info(f"WARN {msg}")
+
+_log = _DebugLog()
 
 # Import live trader for real trading
 try:
@@ -57,6 +72,7 @@ class PumpFunSniperBot:
         self.is_running = False
         self.capital = 1000.0
         self.starting_capital = 1000.0
+        self.starting_sol_balance = 0.0  # SOL balance at bot start (for real P&L tracking)
         self.positions: List[Dict] = []
         self.trade_history: List[Dict] = []
         self.new_coins: List[Dict] = []
@@ -69,13 +85,19 @@ class PumpFunSniperBot:
         self.live_mode = False
         self.live_trader = None
 
-        # Configuration - OPTIMIZED (based on testing results - fixed 71% "Dead Token" issue)
+        # Configuration - OPTIMIZED v2 (fixed "buying at the top" + added fast scalps)
         self.config = {
-            'maxPositionSize': 50,       # Base position size
-            'trailingStop': 12,          # KEEP at 12% - good balance
-            'trailingTakeProfit': 30,    # KEEP at 30% - realistic target
-            'minLiquidity': 3,           # OPTIMIZED: 1 → 3 (avoid ultra-small caps)
-            'maxDevHolding': 12,         # OPTIMIZED: 15 → 12 (stricter rug detection)
+            'maxPositionSize': 0.05,
+            'trailingStop': 5,           # 5% — widened to hold through dips before second waves (was 4%)
+            'trailingTakeProfit': 15,    # 15% — take profit before the dump comes
+            'momentumStaleSeconds': 7,   # Sell if no buys for 7s while profitable (was 5s — raised to hold through brief pauses between waves)
+            'latencySlippagePct': 2,     # 2% buffer for execution delay (Bloodmoon showed ~2% actual slippage)
+            'minLiquidity': 3,           # $3 min - filters ultra-low-cap rugpulls
+            'maxDevHolding': 12,         # 12% max - stricter rug detection
+            'maxTopHolder': 25,          # 25% max single non-BC wallet — raised from 20 to reduce over-blocking
+            'minBurnerHolderPct': 8.0,   # check holders with > 8% of supply for burner status (was 5)
+            'burnerTxThreshold': 5,       # wallets with < 5 lifetime txs are flagged as burners
+            'minBurnersToBlock': 3,       # 3+ burner wallets = hard block (was 2, raised to reduce false blocks)
             'autoTrade': True,           # ENABLED for auto-sniping
             'maxOpenPositions': 1,       # Only 1 position at a time (focus strategy)
             'useMartingale': False,      # Enable/disable Martingale on losses
@@ -83,10 +105,10 @@ class PumpFunSniperBot:
             'martingaleMultiplier': 2.0, # Double position after loss
             'maxMartingaleLevel': 3,     # Max 3 levels (1x, 2x, 4x, then reset)
             'earlyDumpDetection': True,  # Exit if price dumps in first 15s
-            'earlyDumpThreshold': -10,   # OPTIMIZED: -8 → -10 (less sensitive, avoid false positives)
+            'earlyDumpThreshold': -7,    # Exit at -7% in first 15s — cut losses fast
             'earlyDumpWindow': 15,       # OPTIMIZED: 10 → 15 (more time before triggering)
             'noBuysExit': True,          # Exit if no buys detected
-            'noBuysWindow': 20,          # CRITICAL FIX: 6 → 20 (was killing 71% of trades too early!)
+            'noBuysWindow': 3,           # 3s — exit dead tokens faster; frees capital for next opportunity
             'useTwitterSentiment': False # Twitter sentiment analysis (requires API key)
         }
 
@@ -107,6 +129,9 @@ class PumpFunSniperBot:
         self.ws_command_queue: queue.Queue = queue.Queue()
         # Real-time price cache populated by WebSocket trade events (no HTTP polling)
         self.token_prices: Dict[str, dict] = {}
+        # Tokens waiting for first buy activity before we enter
+        # {mint: {'coin': coin_data, 'amount': position_size, 'created': time.time()}}
+        self.pending_buys: Dict[str, dict] = {}
 
         # Solana RPC client for on-chain data
         self.solana_client = Client("https://api.mainnet-beta.solana.com")
@@ -207,10 +232,15 @@ class PumpFunSniperBot:
         title = ttk.Label(self.root, text="🎯 Pump.fun Sniper Bot Simulator", style='Title.TLabel')
         title.pack(pady=10)
         
+        # Trading window indicator
+        tw_frame = tk.Frame(self.root, bg='#111111', relief='solid', bd=1)
+        tw_frame.pack(fill='x', padx=10, pady=(0, 4))
+        self.create_trading_window_panel(tw_frame)
+
         # Stats Frame
         stats_frame = tk.Frame(self.root, bg='#1a1a1a', relief='solid', bd=2)
         stats_frame.pack(fill='x', padx=10, pady=5)
-        
+
         self.create_stat_cards(stats_frame)
         
         # Config Frame
@@ -243,6 +273,54 @@ class PumpFunSniperBot:
         self.notebook.add(log_frame, text='📝 Activity Log')
         self.create_log_tab(log_frame)
         
+    def create_trading_window_panel(self, parent):
+        """Dynamic CET trading window indicator — green 15:00-02:00, red otherwise."""
+        from datetime import timezone, timedelta
+        # Left: live status indicator (updates every 30s)
+        self.tw_status_label = tk.Label(
+            parent, text="", bg='#111111', font=('Courier', 11, 'bold'), width=42, anchor='w'
+        )
+        self.tw_status_label.pack(side='left', padx=(12, 0), pady=4)
+
+        # Separator
+        tk.Label(parent, text="│", bg='#111111', fg='#444', font=('Courier', 11)).pack(side='left', padx=6)
+
+        # Right: static schedule legend
+        sched = tk.Frame(parent, bg='#111111')
+        sched.pack(side='left', pady=4)
+        rows = [
+            ("🟢", "15:00–23:00 CET", "US market open — peak volume, real buyers"),
+            ("🟢", "23:00–02:00 CET", "US evening  — most +30%+ scalps happen here"),
+            ("🔴", "02:00–09:00 CET", "Dead zone   — bots & rugs, 18% win rate"),
+            ("🔴", "09:00–15:00 CET", "US asleep   — pump.fun barely active"),
+        ]
+        for icon, window, desc in rows:
+            row = tk.Frame(sched, bg='#111111')
+            row.pack(anchor='w')
+            tk.Label(row, text=icon,    bg='#111111', font=('Courier', 9), width=2).pack(side='left')
+            tk.Label(row, text=window,  bg='#111111', fg='#ccc', font=('Courier', 9, 'bold'), width=18).pack(side='left')
+            tk.Label(row, text=desc,    bg='#111111', fg='#666', font=('Courier', 9)).pack(side='left')
+
+        self._update_trading_window()
+
+    def _update_trading_window(self):
+        from datetime import datetime, timezone, timedelta
+        cet = datetime.now(timezone.utc) + timedelta(hours=1)  # CET = UTC+1 (Paris winter)
+        h, m = cet.hour, cet.minute
+        time_str = cet.strftime('%H:%M')
+        in_window = (h >= 15) or (h < 2)
+        if in_window:
+            text  = f"🟢  {time_str} CET  —  PRIME TIME  ·  Run the bot"
+            color = '#00ff44'
+        elif 2 <= h < 9:
+            text  = f"🔴  {time_str} CET  —  DEAD ZONE   ·  Pause — bots & rugs"
+            color = '#ff4444'
+        else:
+            text  = f"🟡  {time_str} CET  —  LOW VOLUME  ·  Avoid until 15:00"
+            color = '#ffaa00'
+        self.tw_status_label.config(text=text, fg=color)
+        self.root.after(30000, self._update_trading_window)  # refresh every 30s
+
     def create_stat_cards(self, parent):
         # Portfolio Value
         card1 = tk.Frame(parent, bg='#0a0a0a', relief='solid', bd=1)
@@ -274,10 +352,20 @@ class PumpFunSniperBot:
         self.winloss_label = tk.Label(card3, text="0W / 0L (0 trades)", bg='#0a0a0a', fg='#888', font=('Courier', 8))
         self.winloss_label.pack()
         
+        # SOL P&L (real trading P&L in SOL, unaffected by price fluctuations)
+        card_sol = tk.Frame(parent, bg='#0a0a0a', relief='solid', bd=1)
+        card_sol.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+
+        tk.Label(card_sol, text="SOL P&L (session)", bg='#0a0a0a', fg='#888', font=('Courier', 8)).pack()
+        self.sol_pnl_label = tk.Label(card_sol, text="0.0000 SOL", bg='#0a0a0a', fg='#888', font=('Courier', 14, 'bold'))
+        self.sol_pnl_label.pack()
+        self.sol_pnl_sub = tk.Label(card_sol, text="start bot to track", bg='#0a0a0a', fg='#555', font=('Courier', 8))
+        self.sol_pnl_sub.pack()
+
         # Status
         card4 = tk.Frame(parent, bg='#0a0a0a', relief='solid', bd=1)
         card4.pack(side='left', fill='both', expand=True, padx=5, pady=5)
-        
+
         tk.Label(card4, text="Status", bg='#0a0a0a', fg='#888', font=('Courier', 8)).pack()
         self.status_label = tk.Label(card4, text="🟡 PAUSED", bg='#0a0a0a', fg='#f90', font=('Courier', 14, 'bold'))
         self.status_label.pack()
@@ -299,12 +387,12 @@ class PumpFunSniperBot:
 
         tk.Label(row1, text="Max Position ($):", bg='#1a1a1a', fg='#0f0', font=('Courier', 9)).pack(side='left', padx=5)
         self.position_entry = tk.Entry(row1, width=10, font=('Courier', 9))
-        self.position_entry.insert(0, "50")  # 5% of capital - optimal risk
+        self.position_entry.insert(0, "2.00")  # $2 min — fees are 6% not 24% of position
         self.position_entry.pack(side='left', padx=5)
 
         tk.Label(row1, text="Trailing Stop (%):", bg='#1a1a1a', fg='#0f0', font=('Courier', 9)).pack(side='left', padx=5)
         self.trailing_entry = tk.Entry(row1, width=10, font=('Courier', 9))
-        self.trailing_entry.insert(0, "8")  # ULTRA TIGHT - 8% max loss
+        self.trailing_entry.insert(0, "4")  # 4% - tighter for fast scalping
         self.trailing_entry.pack(side='left', padx=5)
 
         tk.Label(row1, text="Take Profit (%):", bg='#1a1a1a', fg='#0f0', font=('Courier', 9)).pack(side='left', padx=5)
@@ -318,12 +406,12 @@ class PumpFunSniperBot:
 
         tk.Label(row2, text="Min Liquidity ($):", bg='#1a1a1a', fg='#0f0', font=('Courier', 9)).pack(side='left', padx=5)
         self.liquidity_entry = tk.Entry(row2, width=10, font=('Courier', 9))
-        self.liquidity_entry.insert(0, "1")  # LOW for sniping fresh tokens (1-5 SOL)
+        self.liquidity_entry.insert(0, "3")  # $3 min - filters ultra-low-cap rugpulls
         self.liquidity_entry.pack(side='left', padx=5)
 
         tk.Label(row2, text="Max Dev Holding (%):", bg='#1a1a1a', fg='#0f0', font=('Courier', 9)).pack(side='left', padx=5)
         self.devhold_entry = tk.Entry(row2, width=10, font=('Courier', 9))
-        self.devhold_entry.insert(0, "15")  # Lower dev holding reduces rug risk
+        self.devhold_entry.insert(0, "12")  # 12% max - stricter rug detection
         self.devhold_entry.pack(side='left', padx=5)
         
         self.autotrade_var = tk.BooleanVar(value=True)  # ENABLED by default for sniping!
@@ -594,6 +682,15 @@ class PumpFunSniperBot:
             self.add_log("❌ Invalid configuration values", 'error')
             return
             
+        # Snapshot SOL balance at start for real P&L tracking
+        if self.live_mode and self.live_trader:
+            try:
+                self.starting_sol_balance = self.live_trader.get_sol_balance()
+            except Exception:
+                self.starting_sol_balance = 0.0
+        else:
+            self.starting_sol_balance = 0.0
+
         self.is_running = True
         self.start_btn.config(text="⏸️ PAUSE", bg='#f90')
         self.status_label.config(text="🟢 ACTIVE", fg='#0f0')
@@ -759,24 +856,273 @@ class PumpFunSniperBot:
                 self.add_log(f"❌ WebSocket error: {str(e)}", 'error')
             
     def handle_trade_event(self, data):
-        """Cache real-time price from a WebSocket trade event (zero API calls)."""
+        """Cache real-time price from a WebSocket trade event (zero API calls).
+
+        Unit normalization:
+          PumpPortal newToken events  → virtualSolReserves  in lamports (e.g. 30_000_000_000)
+                                        virtualTokenReserves in raw units (e.g. 1_073_000_000_000_000)
+          PumpPortal tokenTrades events → vSolInBondingCurve  in SOL     (e.g. 30.5)
+                                          vTokensInBondingCurve in tokens (e.g.  793_000_000)
+        The price loop formula (vsr/1e9)/(vtr/1e6) assumes raw units.
+        Normalise here so the formula stays valid for both sources.
+        """
         mint = data.get('mint')
         if not mint:
             return
-        # PumpPortal trade events expose current bonding curve reserves
         vsr = data.get('vSolInBondingCurve') or data.get('virtualSolReserves')
         vtr = data.get('vTokensInBondingCurve') or data.get('virtualTokenReserves')
         if vsr and vtr:
+            vsr = float(vsr)
+            vtr = float(vtr)
+            # Detect human-unit SOL (< 1e6 = definitely < 1 million SOL) → convert to lamports
+            if vsr < 1e6:
+                vsr *= 1e9
+            # Detect human-unit tokens (< 1e12 = not raw ×1e6 yet) → convert to raw units
+            if vtr < 1e12:
+                vtr *= 1e6
             self.token_prices[mint] = {
-                'virtualSolReserves': float(vsr),
-                'virtualTokenReserves': float(vtr),
+                'virtualSolReserves': vsr,
+                'virtualTokenReserves': vtr,
                 'timestamp': time.time(),
                 'txType': data.get('txType', ''),
             }
+            # Real-time exit check for tokens we hold positions in.
+            # The 0.25s price_update_loop misses bursts of sells that gap through
+            # the -8% hard stop.  Checking HERE catches the FIRST breaching sell.
+            for pos in self.positions:
+                if pos['mint'] == mint and not pos.get('_selling'):
+                    price = (vsr / 1e9) / (vtr / 1e6)
+                    tx = data.get('txType', '')
+                    _log.info(f"TRADE_EVENT {mint[:12]} vsr={vsr:.4e} vtr={vtr:.4e} "
+                              f"price={price:.12e} txType={tx}")
+
+                    # Track consecutive sells and buy momentum
+                    if tx == 'sell':
+                        pos['consecutive_sells'] = pos.get('consecutive_sells', 0) + 1
+                    elif tx == 'buy':
+                        # Only reset sell streak if the buy actually moves price up (not dust)
+                        prev_price = pos.get('currentPrice', pos['buyPrice'])
+                        price_move_pct = ((price - prev_price) / prev_price) * 100 if prev_price > 0 else 0
+                        if price_move_pct >= 0.5:
+                            pos['consecutive_sells'] = 0
+                        pos['last_buy_time'] = time.time()
+                        pos['buy_count_held'] = pos.get('buy_count_held', 0) + 1
+
+                    # Keep cached reserves fresh — used to skip RPC on sell
+                    pos['cached_vsr'] = int(vsr)
+                    pos['cached_vtr'] = int(vtr)
+
+                    pnl_pct = ((price - pos['buyPrice']) / pos['buyPrice']) * 100
+                    consec = pos.get('consecutive_sells', 0)
+                    slip = self.config.get('latencySlippagePct', 2)  # execution slippage buffer
+
+                    # All thresholds shifted by slippage to account for ~2s execution delay.
+                    # Losses: trigger earlier (less negative) so actual exit ≈ intended level.
+                    # Profits: require higher profit so actual exit is still profitable.
+                    if pnl_pct <= -(10 - slip):  # -8% trigger → ~-10% actual
+                        pos['_selling'] = True
+                        pos['_urgent_price'] = price
+                        pos['_urgent_reason'] = 'Emergency Stop'
+                        _log.info(f"EMERGENCY_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% — absolute floor (trigger -{10-slip}%)")
+                    elif pnl_pct <= -(8 - slip) and consec >= 2:  # -6% trigger → ~-8% actual
+                        pos['_selling'] = True
+                        pos['_urgent_price'] = price
+                        pos['_urgent_reason'] = 'Hard Stop'
+                        _log.info(f"URGENT_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% sells={consec} (trigger -{8-slip}%)")
+                    # MOMENTUM EXIT: profitable + sells starting → lock in gains.
+                    # Raised from 2 consec/+4% → 3 consec/+8% to let big runners breathe past early sell waves.
+                    elif pnl_pct >= (6 + slip) and consec >= 3:  # +8% trigger → ~+6% actual
+                        pos['_selling'] = True
+                        pos['_urgent_price'] = price
+                        pos['_urgent_reason'] = 'Momentum Exit'
+                        _log.info(f"MOMENTUM_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% sells={consec} (trigger +{6+slip}%)")
+                    # Break-even: trigger while still positive so actual exit ≈ breakeven.
+                    # Floor raised from <+2% → <+3% (slip+1): TX latency is ~3s — if price drops
+                    # from +4% to +3% and we trigger now, the sell lands at ~0% instead of -4%.
+                    elif pnl_pct < (slip + 1) and ((pos['highestPrice'] - pos['buyPrice']) / pos['buyPrice']) * 100 >= 3:
+                        pos['_selling'] = True
+                        pos['_urgent_price'] = price
+                        pos['_urgent_reason'] = 'Break-Even Exit'
+                        _log.info(f"BREAKEVEN_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% (was +3%+, trigger <+{slip+1}%)")
+                    # Sell cascade: 5+ consecutive sells AND losing (was 3 — raised to avoid GROVEIFY-type exits on dips before pumps)
+                    elif consec >= 5 and pnl_pct < -(3 - slip):  # -1% trigger → ~-3% actual
+                        pos['_selling'] = True
+                        pos['_urgent_price'] = price
+                        pos['_urgent_reason'] = 'Sell Cascade'
+                        _log.info(f"SELL_CASCADE {pos['symbol']} {consec} consecutive sells, "
+                                  f"pnl={pnl_pct:.1f}% (trigger -{3-slip}%)")
+                    break  # only one position per mint
+
+            # Check if this is a trade event for a pending token
+            tx_type = data.get('txType', '')
+            if mint in self.pending_buys:
+                pending = self.pending_buys[mint]
+                current_price = (vsr / 1e9) / (vtr / 1e6)
+                creation_price = pending['creation_price']
+                price_gain = ((current_price - creation_price) / creation_price) * 100
+                # Track SOL volume: how much SOL flowed in since creation
+                sol_volume = (vsr - pending['creation_vsr']) / 1e9  # SOL added to curve
+
+                if tx_type == 'buy':
+                    pending['buy_count'] = pending.get('buy_count', 0) + 1
+                    if 'first_buy_time' not in pending:
+                        pending['first_buy_time'] = time.time()  # track when buying actually started
+                    pending.setdefault('buy_times', []).append(time.time())
+                    if len(pending['buy_times']) > 8:
+                        pending['buy_times'].pop(0)
+                    # Track largest single buy in SOL (vsr delta between events).
+                    # A single buy >0.80 SOL is a whale pumping to bait bots — even if later
+                    # smaller buys bring the average down, the initial whale is likely the dumper.
+                    _prev_vsr = pending.get('last_vsr', pending['creation_vsr'])
+                    _single_buy_sol = (vsr - _prev_vsr) / 1e9
+                    if _single_buy_sol > pending.get('max_single_buy', 0):
+                        pending['max_single_buy'] = _single_buy_sol
+                pending['last_vsr'] = vsr  # update every event (buy or sell)
+                if tx_type == 'sell':
+                    pending['sell_count'] = pending.get('sell_count', 0) + 1
+                    # Track largest single-sell price drop seen during monitoring.
+                    # If one sell dumps the price >1.5%, it's a whale unloading → skip.
+                    _prev_price = pending.get('last_price', current_price)
+                    if _prev_price > 0 and _prev_price > current_price:
+                        _sell_drop_pct = (_prev_price - current_price) / _prev_price * 100
+                        if _sell_drop_pct > pending.get('max_sell_drop', 0):
+                            pending['max_sell_drop'] = _sell_drop_pct
+                # Update last seen price for sell-drop tracking
+                pending['last_price'] = current_price
+                # Rolling window of last 5 tx types for momentum quality check
+                if tx_type in ('buy', 'sell'):
+                    recent = pending.setdefault('recent_txs', [])
+                    recent.append(tx_type)
+                    if len(recent) > 5:
+                        recent.pop(0)
+
+                # Buy acceleration: compare first-half vs second-half buy rate.
+                # Decelerating buy momentum = crowd already leaving = likely dead token.
+                # Requires 4+ buy events; defaults to True (pass) when insufficient data.
+                _buy_times = pending.get('buy_times', [])
+                _is_accelerating = True
+                _accel_ratio = None
+                if len(_buy_times) >= 4:
+                    _mid = len(_buy_times) // 2
+                    _sf = max(_buy_times[_mid - 1] - _buy_times[0], 0.001)
+                    _ss = max(_buy_times[-1]        - _buy_times[_mid], 0.001)
+                    _rf = (_mid - 1) / _sf if _mid > 1 else 0
+                    _rs = (len(_buy_times) - _mid - 1) / _ss if (len(_buy_times) - _mid) > 1 else 0
+                    if _rf > 0:
+                        _accel_ratio = _rs / _rf
+                        _is_accelerating = _accel_ratio >= 0.5  # second half ≥ 50% as fast as first
+
+                # Acceleration is used as a blocking filter only (rejects decelerating tokens).
+                # Entry thresholds are fixed — lowering them for fast accel let rugs through (MILANO -17.5%).
+
+                # Track if anyone is selling early (red flag — could be bait-and-dump)
+                if tx_type == 'sell' and pending.get('buy_count', 0) <= 2:
+                    # Sell before meaningful buys = dump pattern
+                    self.pending_buys.pop(mint)
+                    self.add_log(f"🚩 {pending['coin']['symbol']} — early sell detected, skipping (dump pattern)", 'warning')
+                    self.ws_command_queue.put({
+                        "method": "unsubscribeTokenTrade",
+                        "keys": [mint]
+                    })
+                # SCALP-FOCUSED entry: only enter early (+3-7%), skip anything pumped.
+                # +7%+: late entry disabled — by the time TX confirms (~3s), momentum exhausted.
+                #       Coprolite +6.5% entered → already -3% on first update. ACE ~+10% → rug.
+                elif price_gain > 20:
+                    self.pending_buys.pop(mint)
+                    self.add_log(f"🚩 {pending['coin']['symbol']} — already +{price_gain:.0f}% (too late), skipping", 'warning')
+                    self.ws_command_queue.put({
+                        "method": "unsubscribeTokenTrade",
+                        "keys": [mint]
+                    })
+                elif price_gain >= 7:
+                    # Late entry disabled — TX takes ~3s, token peaked by confirmation time.
+                    # Losses: CHEEZYCA -4%, Kiki -12.9%, ACE -3.4%, Coprolite -6.1%
+                    pass
+                elif (price_gain >= 3
+                      and pending.get('buy_count', 0) >= 1 and sol_volume >= 0.4
+                      and pending.get('sell_count', 0) < pending.get('buy_count', 0)
+                      and pending.get('recent_txs', []).count('sell') < 2
+                      and pending.get('max_sell_drop', 0) < 1.5
+                      and pending.get('max_single_buy', 0) <= 0.65
+                      and tx_type == 'buy'
+                      and (sol_volume / max(pending.get('buy_count', 1), 1)) <= 0.50
+                      and (sol_volume / max(pending.get('buy_count', 1), 1)) >= 0.07
+                      and (time.time() - pending['created']) >= 1.5
+                      and (time.time() - pending['created']) <= 15
+                      and _is_accelerating):
+                    # ENTRY: min gain 3%, min 1 buy, vol ≥ 0.4 SOL, avg buy 0.06–0.50 SOL, age 1.5–15s.
+                    # avg_buy ≤ 0.50: blocks pure mega-whale pumps (>0.50 SOL avg).
+                    # avg_buy ≥ 0.07: blocks bot-farmed volume (Javis 0.055 -9.7%, CITY 0.061 -6.5%).
+                    # max_single_buy ≤ 0.65: blocks bait-and-dump — one whale pumps >0.65 SOL to pump
+                    #   price, then places smaller buys to normalize avg, then dumps after bots enter.
+                    #   Caught: Shit (1.21 SOL first buy -7.2%), RAGENALD (0.664 SOL first buy -10.1%).
+                    # sell_dump<1.5%: blocks entries where a whale already dumped during monitoring.
+                    # recent_txs: skip if 2+ of last 5 trades are sells (momentum cooling).
+                    pending.pop('_near_miss_logged', None)  # clear flag on actual entry
+                    self.pending_buys.pop(mint)
+                    coin = pending['coin']
+                    amount = pending['amount']
+                    coin['virtual_sol_reserves'] = vsr
+                    coin['virtual_token_reserves'] = vtr
+                    coin['price'] = current_price
+                    if coin.get('prefetched_curve'):
+                        coin['prefetched_curve']['virtual_sol_reserves'] = int(vsr)
+                        coin['prefetched_curve']['virtual_token_reserves'] = int(vtr)
+                    wait_time = time.time() - pending['created']
+                    self.add_log(f"🚀 EARLY ENTRY: {coin['symbol']} +{price_gain:.1f}% | {pending['buy_count']} buys | {sol_volume:.2f} SOL vol | {wait_time:.1f}s", 'success')
+                    _log.info(f"PENDING_TRIGGER {coin['symbol']} mint={mint[:12]} "
+                              f"waited={wait_time:.1f}s price={coin['price']:.12e} "
+                              f"gain={price_gain:.1f}% buys={pending['buy_count']} vol={sol_volume:.2f}")
+
+                    # Re-check we still have capacity and capital
+                    if (len(self.positions) < self.config['maxOpenPositions'] and
+                            self.capital >= amount):
+                        # BUY_GATE (dev/top/burner RPC checks) removed — always returned 0% for
+                        # all tokens due to RPC propagation delay on fresh mints. Cost: 500-1500ms.
+                        # Protection now comes from: sell_dump<1.5% entry filter, trailing stop,
+                        # instant-rug exit, and sell-cascade detection during position monitoring.
+                        self.execute_buy(coin, amount)
+                    else:
+                        reason = f"positions={len(self.positions)}/{self.config['maxOpenPositions']}" if len(self.positions) >= self.config['maxOpenPositions'] else f"capital={self.capital:.2f}<{amount:.2f}"
+                        self.add_log(f"⏸️ {coin['symbol']} - can't buy (max positions or low capital)", 'info')
+                        _log.info(f"BUY_SKIP {coin['symbol']} mint={mint[:12]} reason={reason}")
+                        self.ws_command_queue.put({
+                            "method": "unsubscribeTokenTrade",
+                            "keys": [mint]
+                        })
+                elif price_gain >= 3 and tx_type == 'buy' and not pending.get('_near_miss_logged'):
+                    # Token hit gain threshold but failed other entry conditions.
+                    # Log once per token so we can diagnose which filter is too strict.
+                    pending['_near_miss_logged'] = True
+                    buy_count  = pending.get('buy_count', 0)
+                    sell_count = pending.get('sell_count', 0)
+                    recent_sells = pending.get('recent_txs', []).count('sell')
+                    avg_buy = sol_volume / max(buy_count, 1)
+                    reasons = []
+                    if buy_count < 1:                        reasons.append(f"buys={buy_count}<1")
+                    if sol_volume < 0.4:                     reasons.append(f"vol={sol_volume:.2f}<0.4")
+                    if recent_sells >= 2:                    reasons.append(f"recent_sells={recent_sells}/5")
+                    if avg_buy > 0.50:                       reasons.append(f"avg_buy={avg_buy:.3f}>0.50")
+                    if sell_count >= buy_count:              reasons.append(f"sells({sell_count})>=buys({buy_count})")
+                    _sell_drop = pending.get('max_sell_drop', 0)
+                    if _sell_drop >= 1.5:                    reasons.append(f"sell_dump={_sell_drop:.1f}%>1.5%")
+                    _max_single = pending.get('max_single_buy', 0)
+                    if _max_single > 0.65:                   reasons.append(f"single_buy={_max_single:.2f}SOL>0.65")
+                    if avg_buy < 0.07:                       reasons.append(f"avg_buy={avg_buy:.3f}<0.07(bot_farm)")
+                    token_age = time.time() - pending['created']
+                    if token_age < 1.5:                      reasons.append(f"token_age={token_age:.1f}s<1.5s(too_fresh)")
+                    if token_age > 15:                       reasons.append(f"token_age={token_age:.0f}s>15s")
+                    if _accel_ratio is not None and not _is_accelerating: reasons.append(f"decel={_accel_ratio:.2f}<0.5")
+                    reason_str = ', '.join(reasons) if reasons else 'unknown'
+                    _log.info(f"NEAR_MISS {pending['coin']['symbol']} gain={price_gain:.1f}% buys={buy_count} vol={sol_volume:.2f} — {reason_str}")
+                    self.add_log(f"⚡ near miss: {pending['coin']['symbol']} +{price_gain:.1f}% — {reason_str}", 'info')
 
     def handle_new_coin(self, data):
+        # Sanitize symbol/name — PumpPortal sends Unicode/emojis that crash Windows console
         symbol = data.get('symbol', data['mint'][:6])
         name = data.get('name', symbol)
+        symbol = symbol.encode('ascii', 'ignore').decode('ascii').strip() or data['mint'][:6]
+        name = name.encode('ascii', 'ignore').decode('ascii').strip() or symbol
         self.add_log(f"🆕 New token detected: {symbol}", 'info')
 
         try:
@@ -786,6 +1132,18 @@ class PumpFunSniperBot:
             vtr = data.get('virtualTokenReserves') or data.get('vTokensInBondingCurve')
 
             if vsr and vtr:
+                # Normalise reserves to raw units so the price formula
+                # (vsr/1e9)/(vtr/1e6) is consistent with trade-event updates.
+                # PumpPortal newToken may send human-unit values (SOL, tokens)
+                # or raw-unit values (lamports, raw tokens) depending on version.
+                # Same thresholds used in handle_trade_event.
+                vsr_raw = float(vsr)
+                vtr_raw = float(vtr)
+                if vsr_raw < 1e6:    # Human SOL (e.g. 30.0) → lamports
+                    vsr_raw *= 1e9
+                if vtr_raw < 1e12:   # Human tokens (e.g. 793_000_000) → raw units
+                    vtr_raw *= 1e6
+
                 # Build prefetched_curve so the live buy can skip BC_RETRIES RPC polling.
                 # traderPublicKey = creator (needed for creator-vault PDA).
                 trader_key = data.get('traderPublicKey')
@@ -794,8 +1152,8 @@ class PumpFunSniperBot:
                 if trader_key:
                     try:
                         prefetched_curve = {
-                            'virtual_token_reserves': int(float(vtr)),
-                            'virtual_sol_reserves':   int(float(vsr)),
+                            'virtual_token_reserves': int(vtr_raw),
+                            'virtual_sol_reserves':   int(vsr_raw),
                             'real_token_reserves':    0,
                             'real_sol_reserves':      0,
                             'bonding_curve_pda':      bc_key or '',
@@ -808,8 +1166,10 @@ class PumpFunSniperBot:
                     'mint': data['mint'],
                     'symbol': symbol,
                     'name': name,
-                    'virtual_sol_reserves': float(vsr),
-                    'virtual_token_reserves': float(vtr),
+                    'creator_address': trader_key or '',
+                    'bonding_curve_key': bc_key or '',
+                    'virtual_sol_reserves': vsr_raw,
+                    'virtual_token_reserves': vtr_raw,
                     'real_sol_reserves': data.get('real_sol_reserves', 0),
                     'real_token_reserves': data.get('real_token_reserves', 0),
                     'uri': data.get('metadata_uri') or data.get('uri', ''),
@@ -824,10 +1184,11 @@ class PumpFunSniperBot:
                     'onchain': True,
                     'prefetched_curve': prefetched_curve,
                 }
-                # Seed the price cache so the first price-update cycle has data immediately
+                # Seed the price cache with normalised raw-unit values so the first
+                # price-update cycle uses the same scale as subsequent trade events.
                 self.token_prices[data['mint']] = {
-                    'virtualSolReserves': float(vsr),
-                    'virtualTokenReserves': float(vtr),
+                    'virtualSolReserves': vsr_raw,
+                    'virtualTokenReserves': vtr_raw,
                     'timestamp': time.time(),
                 }
             else:
@@ -835,6 +1196,13 @@ class PumpFunSniperBot:
                 coin_data = self.fetch_from_solana(data['mint'], symbol=symbol, name=name)
                 if not coin_data:
                     coin_data = self.fetch_coin_data_direct(data['mint'])
+                # Seed price cache from RPC data so the fast path works after buy
+                if coin_data and coin_data.get('virtual_sol_reserves') and coin_data.get('virtual_token_reserves'):
+                    self.token_prices[data['mint']] = {
+                        'virtualSolReserves': float(coin_data['virtual_sol_reserves']),
+                        'virtualTokenReserves': float(coin_data['virtual_token_reserves']),
+                        'timestamp': time.time(),
+                    }
 
             if coin_data:
                 self.add_log(f"✅ Got REAL data for {symbol}", 'success')
@@ -857,9 +1225,29 @@ class PumpFunSniperBot:
                     if self.config['useMartingale'] and self.consecutive_losses > 0:
                         self.add_log(f"📈 Martingale Level {self.consecutive_losses}: ${position_amount:.2f} ({self.consecutive_losses}x losses)", 'warning')
 
-                    self.execute_buy(coin, position_amount)
+                    # Don't buy immediately — wait for confirmed momentum.
+                    # Require price +3% above creation AND at least 2 buy events
+                    # AND at least 0.3 SOL total volume. Enter EARLY before the wave peaks.
+                    self.pending_buys[coin['mint']] = {
+                        'coin': coin,
+                        'amount': position_amount,
+                        'created': time.time(),
+                        'creation_price': coin['price'],
+                        'creation_vsr': coin.get('liquidity', 30) * 1e9,  # SOL reserves at creation (lamports)
+                        'buy_count': 0,
+                        'sell_count': 0,
+                        'buy_times': [],
+                    }
+                    self.ws_command_queue.put({
+                        "method": "subscribeTokenTrade",
+                        "keys": [coin['mint']]
+                    })
+                    self.add_log(f"👀 WATCHING {coin['symbol']} — waiting for first buy...", 'info')
                 elif not risk['safe']:
-                    self.add_log(f"🚫 REJECTED {coin['symbol']} | {risk['risks'][0]}", 'warning')
+                    failing = [r for r in risk['risks'] if r.startswith('❌') or r.startswith('⚠️')]
+                    reject_reason = failing[0] if failing else risk['risks'][0]
+                    self.add_log(f"🚫 REJECTED {coin['symbol']} | Score:{risk['riskScore']} | {reject_reason}", 'warning')
+                    _log.info(f"REJECTED {coin['symbol']} mint={coin['mint'][:12]} score={risk['riskScore']} reason={reject_reason} dev={coin.get('devHolding',0):.1f}% top={coin.get('topHolderPct',0):.1f}% burners={coin.get('burnerWalletCount',0)}")
                 else:
                     # Log why we didn't trade
                     if not self.config['autoTrade']:
@@ -943,14 +1331,112 @@ class PumpFunSniperBot:
         # Paper mode - assume can sell
         return {'mintAuthority': True, 'freezeAuthority': True, 'canSell': True}
 
+    def get_holder_risk_data(self, mint_address: str, bonding_curve_key: str,
+                             check_burners: bool = True) -> tuple:
+        """Return (max_holder_pct, burner_count).
+
+        max_holder_pct: largest single holder % excluding the bonding curve (0.0 on failure).
+        burner_count: number of significant holders (>minBurnerHolderPct) whose owner wallet
+                      has fewer than burnerTxThreshold lifetime transactions — indicates a
+                      freshly-funded burner wallet used for coordinated dump schemes.
+
+        check_burners=False: skip per-holder RPC calls (fast path for initial token evaluation).
+        check_burners=True:  full check including getAccountInfo + getSignaturesForAddress per candidate.
+        """
+        try:
+            mint_pubkey = Pubkey.from_string(mint_address)
+            bc_ata = None
+            if bonding_curve_key:
+                try:
+                    bc_ata = str(get_associated_token_address(
+                        Pubkey.from_string(bonding_curve_key), mint_pubkey
+                    ))
+                except Exception:
+                    pass
+            resp = self.solana_client.get_token_largest_accounts(mint_pubkey, commitment=Processed)
+            if not resp.value:
+                return (0.0, 0)
+            max_pct = 0.0
+            candidates = []  # (ata_address_str, pct) for significant non-BC holders
+            min_pct = self.config.get('minBurnerHolderPct', 5.0)
+            for account in resp.value:
+                ata_str = str(account.address)
+                if bc_ata and ata_str == bc_ata:
+                    continue  # skip bonding curve — it holds unsold supply
+                if account.ui_amount is not None:
+                    pct = (float(account.ui_amount) / 1_000_000_000) * 100
+                    if pct > max_pct:
+                        max_pct = pct
+                    if pct > min_pct and len(candidates) < 3:
+                        candidates.append((ata_str, pct))
+
+            # Fast path: skip per-holder RPC calls when called at creation time.
+            # Burner check runs at buy trigger time instead (see execute_buy gate).
+            if not check_burners:
+                _log.info(
+                    f"HOLDER_CHECK mint={mint_address[:12]} top={max_pct:.1f}% "
+                    f"candidates={len(candidates)} burners=skipped"
+                )
+                return (max_pct, 0)
+
+            # Burner wallet check: fetch owner of each significant holder ATA,
+            # then count their lifetime transactions. Fresh (<5 txs) = burner.
+            burner_count = 0
+            tx_threshold = self.config.get('burnerTxThreshold', 5)
+            for ata_addr, pct in candidates:
+                try:
+                    resp2 = self.solana_client.get_account_info(
+                        Pubkey.from_string(ata_addr), commitment=Processed
+                    )
+                    if not (resp2.value and resp2.value.data and len(resp2.value.data) >= 64):
+                        continue
+                    # SPL token account layout: bytes 0-31 = mint, bytes 32-63 = owner pubkey
+                    owner_bytes = bytes(resp2.value.data[32:64])
+                    owner_pubkey = Pubkey.from_bytes(owner_bytes)
+                    sigs = self.solana_client.get_signatures_for_address(owner_pubkey, limit=10)
+                    tx_count = len(sigs.value) if sigs.value else 0
+                    if tx_count < tx_threshold:
+                        burner_count += 1
+                        _log.info(
+                            f"BURNER_WALLET detected: owner={str(owner_pubkey)[:16]}... "
+                            f"txs={tx_count} pct={pct:.1f}%"
+                        )
+                except Exception:
+                    pass  # skip this holder on any RPC error
+
+            _log.info(
+                f"HOLDER_CHECK mint={mint_address[:12]} top={max_pct:.1f}% "
+                f"candidates={len(candidates)} burners={burner_count}"
+            )
+            return (max_pct, burner_count)
+        except Exception:
+            pass
+        return (0.0, 0)
+
+    def get_dev_holding_pct(self, mint_address: str, creator_address: str) -> float:
+        """Fetch the creator's token holding % via RPC. Returns 0.0 on failure."""
+        if not creator_address:
+            return 0.0
+        try:
+            mint_pubkey    = Pubkey.from_string(mint_address)
+            creator_pubkey = Pubkey.from_string(creator_address)
+            ata = get_associated_token_address(creator_pubkey, mint_pubkey)
+            resp = self.solana_client.get_token_account_balance(ata, commitment=Processed)
+            if resp.value and resp.value.ui_amount is not None:
+                # pump.fun total supply is always 1,000,000,000 tokens
+                return (float(resp.value.ui_amount) / 1_000_000_000) * 100
+        except Exception:
+            pass
+        return 0.0
+
     def process_coin(self, coin_data):
         price = self.calculate_price(coin_data)
 
-        # Get REAL security data from blockchain
+        # Only non-RPC check at creation — honeypot / mintAuthority / freezeAuthority.
+        # In paper mode this returns hardcoded safe values instantly (~0ms).
+        # All RPC security checks (dev holding, top holder, burner wallets) are deferred
+        # to buy trigger time so trade events are tracked from the very first millisecond.
         security = self.check_token_security(coin_data['mint'])
-
-        # Estimate dev holding from creator balance (we don't have exact data without API)
-        dev_holding = 10 + (hash(coin_data['mint']) % 30)
 
         return {
             'mint': coin_data['mint'],
@@ -958,7 +1444,13 @@ class PumpFunSniperBot:
             'symbol': coin_data.get('symbol', 'UNKN'),
             'price': price,
             'liquidity': coin_data.get('virtual_sol_reserves', 0) / 1e9,
-            'devHolding': dev_holding,
+            # RPC security fields — populated at buy trigger time with fresh data
+            'devHolding': 0.0,
+            'topHolderPct': 0.0,
+            'burnerWalletCount': 0,
+            # Pass creator + bonding curve addresses for security checks at buy time
+            'creator_address': coin_data.get('creator_address', ''),
+            'bonding_curve_key': coin_data.get('bonding_curve_key', ''),
             'marketCap': coin_data.get('market_cap', 0),
             'createdAt': coin_data.get('created_timestamp', int(time.time() * 1000)),
             'canSell': security['canSell'],
@@ -982,32 +1474,21 @@ class PumpFunSniperBot:
         return 0.0001
         
     def check_metadata_quality(self, coin):
-        """Check if metadata is uploaded directly (bypassing IPFS delay)"""
-        # Tokens that bypass IPFS upload metadata instantly = sophisticated devs
-        metadata_score = 0
+        """Check if token has basic on-chain metadata.
 
-        # Check if token has complete metadata (passing coin object now)
-        if coin.get('name') and len(coin.get('name', '')) > 2 and coin['name'] != 'Unknown':
-            metadata_score += 10
-        if coin.get('symbol') and len(coin.get('symbol', '')) > 1 and coin['symbol'] != 'UNKN':
-            metadata_score += 10
-        if coin.get('uri'):  # Has metadata URI
-            metadata_score += 15
-        if coin.get('image_uri'):  # Has image
-            metadata_score += 10
-        if coin.get('description') and len(coin.get('description', '')) > 10:
-            metadata_score += 10
-        # Social links = extra effort from dev
-        if coin.get('twitter'):
-            metadata_score += 10
-        if coin.get('telegram'):
-            metadata_score += 5
-        if coin.get('website'):
-            metadata_score += 10
+        PumpPortal WebSocket events include name, symbol and metadata URI directly
+        from the creation transaction. Social links (twitter/telegram/website) live
+        inside the off-chain IPFS JSON and are NOT included in PumpPortal events,
+        so they cannot be used as a filter here.
 
-        # Instant complete metadata = bypassed IPFS = sophisticated dev
-        # Score >= 35 means good metadata (name + symbol + uri + image OR socials)
-        return metadata_score >= 35
+        Minimum bar: token must have a real name, real symbol, and a metadata URI.
+        Tokens with no name/symbol/URI get a +40 penalty in check_rugpull_risk.
+        Dead tokens that pass this check are caught by the 8s noBuysWindow exit.
+        """
+        has_name   = bool(coin.get('name')   and len(coin.get('name',   '')) > 2 and coin['name']   != 'Unknown')
+        has_symbol = bool(coin.get('symbol') and len(coin.get('symbol', '')) > 1 and coin['symbol'] != 'UNKN')
+        has_uri    = bool(coin.get('uri'))
+        return has_name and has_symbol and has_uri
 
     def check_rugpull_risk(self, coin):
         risks = []
@@ -1019,28 +1500,46 @@ class PumpFunSniperBot:
             risk_score += 100
             return {'riskScore': risk_score, 'risks': risks, 'safe': False}
 
-        # High dev holdings
+        # Top holder concentration — hard block (flash dump whale risk)
+        if coin.get('topHolderPct', 0) > self.config.get('maxTopHolder', 20):
+            risks.append(f"❌ Top holder {coin['topHolderPct']:.1f}% — flash dump risk")
+            risk_score += 50  # hard block
+
+        # Burner wallet detection — coordinated multi-wallet dump risk
+        burner_count = coin.get('burnerWalletCount', 0)
+        min_burners = self.config.get('minBurnersToBlock', 2)
+        if burner_count >= min_burners:
+            risks.append(f"❌ {burner_count} burner wallets — coordinated dump risk")
+            risk_score += 50  # hard block
+            _log.info(f"MULTI_WALLET_RUG {coin['symbol']} mint={coin['mint'][:12]} burners={burner_count}")
+        elif burner_count == 1:
+            risks.append(f"⚠️ 1 burner wallet detected")
+            risk_score += 15
+            _log.info(f"BURNER_WALLET {coin['symbol']} mint={coin['mint'][:12]} burners=1")
+
+        # High dev holdings — hard block (dev can dump entire position at any time)
         if coin['devHolding'] > self.config['maxDevHolding']:
-            risks.append(f"❌ Dev holds {coin['devHolding']:.1f}% (team tokens not vested)")
-            risk_score += 30
+            risks.append(f"❌ Dev holds {coin['devHolding']:.1f}% — rug risk")
+            risk_score += 50  # pushes past safe threshold of 40 → hard block
         else:
             risks.append(f"✅ Dev holdings OK ({coin['devHolding']:.1f}%)")
 
-        # Low liquidity
-        if coin['liquidity'] < self.config['minLiquidity']:
-            risks.append(f"⚠️ Low liquidity: ${coin['liquidity']:.0f}")
-            risk_score += 20
+        # Liquidity check removed from scoring.
+        # minLiquidity config is in USD ($3) but coin['liquidity'] is in SOL (always 30+).
+        # The comparison was always False for real tokens and only penalised when reserve
+        # data was unavailable (producing a false $0 reading).
+        # Metadata + social link filter handles low-effort tokens instead.
 
-        # Bonus: Good metadata quality (IPFS bypass = good)
+        # Metadata quality — HARD BLOCK. Only buy tokens with quality metadata.
         has_quality_metadata = self.check_metadata_quality(coin)
-        if has_quality_metadata:
-            risk_score -= 10  # Reduce risk for quality metadata
-            risks.append('✅ Quality metadata (IPFS bypass)')
-            self.add_log(f"⭐ {coin['symbol']} has quality metadata - sophisticated dev!", 'success')
+        if not has_quality_metadata:
+            risks.append('❌ No metadata — skipping')
+            return {'riskScore': 100, 'risks': risks, 'safe': False}
 
-        # Safe threshold adjusted for Pump.fun sniping
-        # Allow tokens with some risk (authorities not burned yet) if metadata is good
-        return {'riskScore': risk_score, 'risks': risks, 'safe': risk_score < 50}
+        risks.append('✅ Quality metadata')
+        self.add_log(f"⭐ {coin['symbol']} has quality metadata", 'success')
+
+        return {'riskScore': risk_score, 'risks': risks, 'safe': risk_score < 40}
         
     def execute_buy(self, coin, amount):
         # Live trading mode
@@ -1048,19 +1547,20 @@ class PumpFunSniperBot:
             try:
                 # Get real SOL price
                 sol_price_usd = self.get_sol_price_usd()
-                sol_amount = min(amount / sol_price_usd, 0.1)  # Max 0.1 SOL safety limit
+                sol_amount = min(amount / sol_price_usd, 0.2)  # Max 0.2 SOL safety limit
 
                 self.add_log(f"🔴 LIVE BUY: {coin['symbol']} with {sol_amount:.4f} SOL (${amount:.2f} @ ${sol_price_usd:.2f}/SOL)", 'warning')
                 self.add_log(f"[DEBUG] Mint: {coin['mint']}", 'info')
 
                 # Execute real buy transaction (pass pre-fetched curve to skip RPC polling)
                 signature = self.live_trader.buy_token_pumpfun(
-                    coin['mint'], sol_amount, max_slippage=0.1,
+                    coin['mint'], sol_amount, max_slippage=0.25,
                     prefetched_curve=coin.get('prefetched_curve')
                 )
 
                 if not signature:
                     self.add_log(f"❌ LIVE BUY FAILED for {coin['symbol']}", 'error')
+                    _log.info(f"BUY_FAIL {coin['symbol']} mint={coin['mint'][:12]} reason=no_signature")
                     return
 
                 # Log transaction signature with Solscan link
@@ -1068,62 +1568,53 @@ class PumpFunSniperBot:
                 self.add_log(f"📝 TX Signature: {signature}", 'success')
                 self.add_log(f"🔗 Solscan: {solscan_url}", 'info')
 
-                # Get actual tokens received with retry logic (avoid rate limits)
-                token_balance = 0
-                max_retries = 3
-                self.add_log(f"[DEBUG] Starting balance check with {max_retries} retries...", 'info')
-
-                for attempt in range(max_retries):
-                    try:
-                        wait_time = 2 + attempt  # 2s, 3s, 4s
-                        self.add_log(f"[DEBUG] Retry {attempt + 1}/{max_retries}: Waiting {wait_time}s before query...", 'info')
-                        time.sleep(wait_time)
-
-                        # Use verbose mode on last attempt for full debug
-                        verbose = (attempt == max_retries - 1)
-                        token_balance = self.live_trader.get_token_balance(coin['mint'], verbose=verbose)
-
-                        if token_balance > 0:
-                            self.add_log(f"✅ Balance retrieved: {token_balance:.2f} tokens", 'success')
-                            break
-                        else:
-                            self.add_log(f"⚠️ Retry {attempt + 1}/{max_retries}: Balance still 0", 'warning')
-
-                    except Exception as retry_error:
-                        error_type = type(retry_error).__name__
-                        error_msg = str(retry_error)
-                        self.add_log(f"⚠️ Retry {attempt + 1}/{max_retries} failed: {error_type}: {error_msg}", 'warning')
-
-                        # Check if it's a rate limit error
-                        if '429' in error_msg or 'Too Many Requests' in error_msg:
-                            self.add_log(f"[DEBUG] ❌ RATE LIMIT ERROR - RPC is throttling requests", 'error')
-
-                        if attempt < max_retries - 1:
-                            time.sleep(3)
+                # Get actual tokens received — get_token_balance already retries
+                # 5 times with 1s sleeps internally, so just a brief wait + single call
+                time.sleep(0.3)  # tiny delay for RPC propagation
+                token_balance = self.live_trader.get_token_balance(coin['mint'], verbose=True)
 
                 if token_balance == 0:
-                    self.add_log(f"❌ Failed to get token balance after {max_retries} attempts", 'error')
+                    self.add_log(f"❌ Failed to get token balance after 5 attempts", 'error')
                     self.add_log(f"[DEBUG] Possible causes: 1) Instant rug (token worthless <1s), 2) Rate limit (429 error), 3) ATA creation failed", 'error')
                     self.add_log(f"[DEBUG] Check Solscan to verify: {solscan_url}", 'error')
                     return
 
+                usd_amount = sol_amount * sol_price_usd
+
+                # Calculate ACTUAL buy price from what we paid vs what we received.
+                # sol_amount / token_balance = effective SOL per token (the real execution price).
+                # Previous approach (RPC bonding curve read) was wrong — it captured a
+                # random snapshot AFTER the tx, often at a peak, causing false hard stops.
+                actual_price = coin['price']  # fallback: trigger price
+                if token_balance > 0:
+                    actual_price = sol_amount / token_balance
+                    _log.info(f"BUY_PRICE_UPDATE {coin['symbol']} trigger={coin['price']:.12e} actual={actual_price:.12e} (sol={sol_amount}/tokens={token_balance:.2f})")
+                else:
+                    _log.info(f"BUY_PRICE_UPDATE {coin['symbol']} trigger={coin['price']:.12e} actual=FALLBACK (no token_balance)")
+
                 position = {
                     'mint': coin['mint'],
                     'symbol': coin['symbol'],
-                    'buyPrice': coin['price'],
-                    'currentPrice': coin['price'],
-                    'highestPrice': coin['price'],
-                    'amount': sol_amount * sol_price_usd,  # USD value for tracking
-                    'quantity': token_balance,
-                    'sol_amount': sol_amount,  # Track SOL spent
-                    'stopLoss': coin['price'] * (1 - self.config['trailingStop'] / 100),
-                    'takeProfit': coin['price'] * (1 + self.config['trailingTakeProfit'] / 100),
+                    'buyPrice': actual_price,
+                    'currentPrice': actual_price,
+                    'highestPrice': actual_price,
+                    'amount': usd_amount,
+                    'quantity': usd_amount / actual_price,  # Same formula as paper — P&L comes out in USD
+                    'token_balance': token_balance,  # Actual tokens for on-chain sell
+                    'sol_amount': sol_amount,
+                    'stopLoss': actual_price * (1 - self.config['trailingStop'] / 100),
+                    'takeProfit': actual_price * (1 + self.config['trailingTakeProfit'] / 100),
                     'buyTime': time.time(),
                     'lastBuyActivity': time.time(),
                     'pnl': 0,
                     'pnlPercent': 0,
                     'live': True,
-                    'signature': signature
+                    'signature': signature,
+                    'consecutive_sells': 0,
+                    # Cached curve data — skip bonding curve RPC on sell
+                    'cached_creator': (coin.get('prefetched_curve') or {}).get('creator'),
+                    'cached_vsr': int(coin.get('virtual_sol_reserves', 0)),
+                    'cached_vtr': int(coin.get('virtual_token_reserves', 0)),
                 }
 
                 self.positions.append(position)
@@ -1131,6 +1622,7 @@ class PumpFunSniperBot:
 
             except Exception as e:
                 self.add_log(f"❌ LIVE BUY ERROR: {str(e)}", 'error')
+                _log.info(f"BUY_FAIL {coin['symbol']} mint={coin['mint'][:12]} reason=exception err={str(e)[:80]}")
                 return
 
         # Paper trading mode
@@ -1153,7 +1645,8 @@ class PumpFunSniperBot:
                 'lastBuyActivity': time.time(),
                 'pnl': 0,
                 'pnlPercent': 0,
-                'live': False
+                'live': False,
+                'consecutive_sells': 0,
             }
 
             self.capital -= amount
@@ -1166,6 +1659,13 @@ class PumpFunSniperBot:
             "keys": [coin['mint']]
         })
 
+        # Debug: log buy details
+        pos = self.positions[-1]
+        _log.info(f"BUY {pos['symbol']} mint={coin['mint'][:12]} "
+                  f"buyPrice={pos['buyPrice']:.12e} quantity={pos['quantity']:.6e} "
+                  f"amount={pos['amount']:.4f} live={pos.get('live',False)} "
+                  f"cache={'YES' if coin['mint'] in self.token_prices else 'NO'}")
+
         self.root.after(0, self.update_display)
         
     def execute_sell(self, position, reason):
@@ -1174,15 +1674,34 @@ class PumpFunSniperBot:
             try:
                 self.add_log(f"🔴 LIVE SELL: {position['symbol']} | Reason: {reason}", 'warning')
 
-                # Get current token balance
-                token_balance = self.live_trader.get_token_balance(position['mint'])
+                # Use stored token_balance — skip redundant RPC balance check
+                # sell_token_pumpfun has its own get_token_balance which would add 1-5s delay
+                token_balance = position.get('token_balance', 0)
+                if token_balance <= 0:
+                    # Fallback: query on-chain if we somehow lost the stored balance
+                    token_balance = self.live_trader.get_token_balance(position['mint'])
 
                 if token_balance > 0:
-                    # Execute real sell transaction
+                    # Build cached curve from WS data to skip bonding curve RPC on sell
+                    cached_curve = None
+                    creator = position.get('cached_creator')
+                    vsr = position.get('cached_vsr', 0)
+                    vtr = position.get('cached_vtr', 0)
+                    if creator and vsr > 0 and vtr > 0:
+                        cached_curve = {
+                            'creator': creator,
+                            'virtual_sol_reserves': vsr,
+                            'virtual_token_reserves': vtr,
+                            'real_token_reserves': 0,
+                            'real_sol_reserves': 0,
+                        }
+                    # Execute real sell transaction (skip balance + curve RPC if cache available)
                     signature = self.live_trader.sell_token_pumpfun(
                         position['mint'],
                         token_balance,
-                        max_slippage=0.1
+                        max_slippage=0.1,
+                        skip_balance_check=True,
+                        cached_curve=cached_curve
                     )
 
                     if signature:
@@ -1206,6 +1725,12 @@ class PumpFunSniperBot:
             pnl_percent = ((position['currentPrice'] - position['buyPrice']) / position['buyPrice']) * 100
             proceeds = position['amount'] + pnl
             self.capital += proceeds
+
+        # Debug: log sell details
+        _log.info(f"SELL {position['symbol']} reason={reason} live={position.get('live',False)} "
+                  f"buyPrice={position['buyPrice']:.12e} currentPrice={position['currentPrice']:.12e} "
+                  f"quantity={position['quantity']:.6e} pnl={pnl:.6f} pnl%={pnl_percent:.2f} "
+                  f"amount={position['amount']:.4f} holdTime={time.time()-position['buyTime']:.1f}s")
 
         trade = {
             **position,
@@ -1365,8 +1890,8 @@ class PumpFunSniperBot:
                         self.add_log(f"⚠️ {pos['symbol']} has 0 balance - removing from tracking", 'warning')
                         self.positions.remove(pos)
                     else:
-                        # Update actual balance from wallet
-                        pos['quantity'] = token_balance
+                        # Update actual token balance (used for on-chain sell)
+                        pos['token_balance'] = token_balance
 
                 except Exception as e:
                     # If we can't fetch balance, keep the position but log warning
@@ -1377,49 +1902,119 @@ class PumpFunSniperBot:
 
     def _apply_price_and_check_exits(self, pos, new_price):
         """Update position price and evaluate all exit conditions. Returns True if sold."""
+        if pos.get('_selling'):
+            return True  # Already flagged / being sold — skip
         self.failed_updates[pos['mint']] = 0
         pos['currentPrice'] = new_price
         pos['highestPrice'] = max(pos['highestPrice'], new_price)
-        pos['stopLoss'] = pos['highestPrice'] * (1 - self.config['trailingStop'] / 100)
+        # Dynamic trailing stop: tighten as profit grows
+        peak_gain_pct = ((pos['highestPrice'] - pos['buyPrice']) / pos['buyPrice']) * 100
+        if peak_gain_pct >= 10:
+            effective_trail = 2   # Very tight at +10%+ — lock in gains
+        elif peak_gain_pct >= 5:
+            effective_trail = 3   # Moderate at +5-10%
+        else:
+            effective_trail = self.config['trailingStop']  # Default 5%
+        pos['stopLoss'] = pos['highestPrice'] * (1 - effective_trail / 100)
+
+        # Tiered profit floor: as peak rises, lock in progressively higher exits.
+        # Each tier adds a hard floor so winners can't fully reverse.
+        #   Peak +3% → floor at +1%  (exit green, not break-even)
+        #   Peak +5% → floor at +3%  (lock in meaningful gain)
+        #   Peak +8% → floor at +5%  (protect strong winners)
+        if peak_gain_pct >= 8:
+            profit_floor_pct = 5.0
+        elif peak_gain_pct >= 5:
+            profit_floor_pct = 3.0
+        elif peak_gain_pct >= 3:
+            profit_floor_pct = 1.0
+        else:
+            profit_floor_pct = 0.0
+        if profit_floor_pct > 0:
+            pos['stopLoss'] = max(pos['stopLoss'], pos['buyPrice'] * (1 + profit_floor_pct / 100))
+
         pos['pnl'] = (new_price - pos['buyPrice']) * pos['quantity']
         pos['pnlPercent'] = ((new_price - pos['buyPrice']) / pos['buyPrice']) * 100
         age = time.time() - pos['buyTime']
+        slip = self.config.get('latencySlippagePct', 2)  # execution slippage buffer
 
-        if pos['pnlPercent'] <= -18:
-            self.add_log(f"🛑 HARD STOP: {pos['pnlPercent']:.1f}% - EMERGENCY EXIT!", 'error')
+        # All loss thresholds shifted by slippage: trigger earlier so actual exit ≈ intended.
+        # All profit thresholds shifted by slippage: require more profit so actual exit is still green.
+        if pos['pnlPercent'] <= -(10 - slip):  # -8% trigger → ~-10% actual
+            self.add_log(f"🛑 EMERGENCY STOP: {pos['pnlPercent']:.1f}%!", 'error')
+            self.execute_sell(pos, f'Emergency Stop ({pos["pnlPercent"]:.1f}%)')
+            return True
+
+        consec = pos.get('consecutive_sells', 0)
+        if pos['pnlPercent'] <= -(8 - slip) and consec >= 2:  # -6% trigger → ~-8% actual
+            self.add_log(f"🛑 HARD STOP: {pos['pnlPercent']:.1f}% ({consec} sells) - EXIT!", 'error')
             self.execute_sell(pos, f'Hard Stop ({pos["pnlPercent"]:.1f}%)')
             return True
 
-        if age <= 3 and pos['pnlPercent'] <= -8:
+        if age <= 5 and pos['pnlPercent'] <= -(5 - slip) and consec >= 2:  # -3% trigger → ~-5% actual
             self.add_log(f"💀 INSTANT RUG: {pos['pnlPercent']:.1f}% in {age:.0f}s - EXIT NOW!", 'error')
             self.execute_sell(pos, f'Instant Rug ({pos["pnlPercent"]:.1f}% in {age:.0f}s)')
             return True
 
         if self.config['earlyDumpDetection'] and age <= self.config['earlyDumpWindow']:
-            if pos['pnlPercent'] <= self.config['earlyDumpThreshold']:
+            if pos['pnlPercent'] <= self.config['earlyDumpThreshold'] + slip:  # -5% trigger → ~-7% actual
                 self.add_log(f"⚡ Early dump: {pos['pnlPercent']:.1f}% in {age:.0f}s", 'warning')
                 self.execute_sell(pos, f'Early Dump (-{abs(pos["pnlPercent"]):.1f}% in {age:.0f}s)')
                 return True
 
-        if self.config['noBuysExit'] and age >= self.config['noBuysWindow']:
-            if pos['highestPrice'] == pos['buyPrice']:
-                self.add_log(f"⚠️ No buying activity for {age:.0f}s", 'warning')
-                self.execute_sell(pos, f'Dead Token (no buys in {age:.0f}s)')
+        # MOMENTUM RIDE: ride while buys flow, exit when they stop.
+        # Need +slip% extra so actual exit is still profitable after execution delay.
+        if pos['pnlPercent'] >= (2 + slip):  # +4% trigger → ~+2% actual
+            last_buy = pos.get('last_buy_time', pos['buyTime'])
+            since_last_buy = time.time() - last_buy
+            stale_threshold = self.config.get('momentumStaleSeconds', 5)
+            # Momentum died: no buy event for N seconds while in profit → take it
+            if since_last_buy >= stale_threshold:
+                self.add_log(f"💰 MOMENTUM SELL: +{pos['pnlPercent']:.1f}% (no buys for {since_last_buy:.0f}s)", 'success')
+                self.execute_sell(pos, f'Momentum Sell (+{pos["pnlPercent"]:.1f}% @ {age:.1f}s)')
                 return True
-            elif age >= self.config['noBuysWindow'] * 2:
-                price_change = ((pos['currentPrice'] - pos['buyPrice']) / pos['buyPrice']) * 100
-                if abs(price_change) < 1:
-                    self.add_log(f"⚠️ Token stagnant: {price_change:.2f}% in {age:.0f}s", 'warning')
-                    self.execute_sell(pos, f'Stagnant (no activity {age:.0f}s)')
-                    return True
 
-        if age >= 20 and -8 < pos['pnlPercent'] < 0:
-            if pos['currentPrice'] == pos['highestPrice'] and pos['pnlPercent'] < -3:
-                self.add_log(f"🔒 Stuck losing: {pos['pnlPercent']:.1f}% for {age:.0f}s - cutting loss", 'warning')
+        # Profit fading: peaked at +3%+ but dropped 3%+ from peak → lock in remainder
+        # (was 2% — raised to 3% so tokens can breathe without false-fading on noise)
+        if peak_gain_pct >= 3 and pos['pnlPercent'] < peak_gain_pct - 4:
+            self.add_log(f"📉 Profit fading: was +{peak_gain_pct:.1f}%, now +{pos['pnlPercent']:.1f}%", 'warning')
+            self.execute_sell(pos, f'Profit Fade (+{pos["pnlPercent"]:.1f}% from peak +{peak_gain_pct:.1f}%)')
+            return True
+
+        if self.config['noBuysExit']:
+            last_buy = pos.get('last_buy_time', pos['buyTime'])
+            since_last_buy = time.time() - last_buy
+            # Only fire dead-token exit when NOT already in profit.
+            # Profitable positions (≥3% pnl) are handled by Momentum Sell above with a
+            # 5s stale timer — skipping noBuysExit here gives them the full 5s window
+            # so second-wave pumps aren't cut short by the 3s dead-token timer.
+            if since_last_buy >= self.config['noBuysWindow'] and pos['pnlPercent'] < (2 + slip):
+                self.add_log(f"⚠️ No buys for {since_last_buy:.0f}s (pnl={pos['pnlPercent']:.1f}%)", 'warning')
+                self.execute_sell(pos, f'Dead Token (no buys in {since_last_buy:.0f}s)')
+                return True
+
+        # Dead and losing: price hasn't moved AND we're in the red → exit after 20s
+        if age >= 20 and pos['pnlPercent'] < -3:
+            # Check if price is stuck (hasn't moved in recent ticks)
+            price_gain_from_buy = ((pos['highestPrice'] - pos['buyPrice']) / pos['buyPrice']) * 100
+            if price_gain_from_buy < 2:
+                self.add_log(f"🔒 Stuck losing: {pos['pnlPercent']:.1f}% for {age:.0f}s (peak only +{price_gain_from_buy:.1f}%)", 'warning')
                 self.execute_sell(pos, f'Stuck Loss ({pos["pnlPercent"]:.1f}% @ {age:.0f}s)')
                 return True
 
-        if age <= 5 and pos['pnlPercent'] >= 20:
+        # Stuck in profit: price frozen (no trades happening), take profit and move on.
+        # Frees up the position slot for new opportunities.
+        if age >= 20 and pos['pnlPercent'] >= 3:
+            # Check if price is barely moving (current ≈ last update = stuck)
+            price_diff_from_peak = ((pos['highestPrice'] - pos['currentPrice']) / pos['highestPrice']) * 100
+            if price_diff_from_peak < 2:  # within 2% of peak = price stalled
+                self.add_log(f"💰 Stuck Profit: +{pos['pnlPercent']:.1f}% frozen for {age:.0f}s — taking profit", 'success')
+                self.execute_sell(pos, f'Stuck Profit (+{pos["pnlPercent"]:.1f}% @ {age:.0f}s)')
+                return True
+
+        # FAST SCALP: Take quick profit in first 15s while momentum is hot.
+        # Target: lock in +8% before the dump. MOMENTUM_EXIT now raised to +8% so we're not cut at +4% first.
+        if age <= 15 and pos['pnlPercent'] >= 8:
             self.add_log(f"⚡ FAST SCALP! +{pos['pnlPercent']:.1f}% in {age:.0f}s", 'success')
             self.execute_sell(pos, f'Fast Scalp (+{pos["pnlPercent"]:.1f}% in {age:.0f}s)')
             return True
@@ -1448,35 +2043,83 @@ class PumpFunSniperBot:
         """Price monitor — uses WebSocket trade cache (instant), falls back to Solana RPC."""
         sync_counter = 0
         while self.price_update_running:
-            time.sleep(0.25)  # 250 ms tick — fast enough for rug detection
+            time.sleep(0.10)  # 100 ms tick — faster exit detection
 
             # Live mode: sync wallet every ~5 s
             if self.live_mode and self.is_running:
                 sync_counter += 1
-                if sync_counter >= 20:  # 20 × 0.25 s = 5 s
+                if sync_counter >= 50:  # 50 × 0.10 s = 5 s
                     self.sync_wallet_positions()
                     sync_counter = 0
+
+            # Clean up stale pending buys (no buy activity within 30s → dead token)
+            now = time.time()
+            stale = [m for m, p in self.pending_buys.items() if now - p['created'] > 30]
+            for mint in stale:
+                pending = self.pending_buys.pop(mint)
+                self.add_log(f"💀 {pending['coin']['symbol']} — no buys in 30s, skipping", 'info')
+                self.ws_command_queue.put({
+                    "method": "unsubscribeTokenTrade",
+                    "keys": [mint]
+                })
 
             if not self.is_running or len(self.positions) == 0:
                 continue
 
             for pos in self.positions[:]:
                 mint = pos['mint']
+
+                # ── URGENT EXIT: flagged by handle_trade_event in real-time ──────
+                # WS handler already decided to sell — execute immediately, don't re-evaluate.
+                # Bug fix: _apply_price_and_check_exits was re-evaluating and finding no match
+                # for SELL_CASCADE at -1.4% (OpenAIGate: -1.4% → sat 24s → -27.7%).
+                if pos.get('_urgent_price'):
+                    urgent_price = pos.pop('_urgent_price')
+                    reason = pos.pop('_urgent_reason', 'Urgent Exit')
+                    pos['_selling'] = False
+                    pos['currentPrice'] = urgent_price
+                    pos['pnlPercent'] = ((urgent_price - pos['buyPrice']) / pos['buyPrice']) * 100
+                    _log.info(f"URGENT_SELL {pos['symbol']} processing at {urgent_price:.12e}")
+                    self.execute_sell(pos, f'{reason} ({pos["pnlPercent"]:.1f}%)')
+                    continue
+
                 try:
                     # ── FAST PATH: WebSocket trade event (zero API calls) ──────────────
+                    # Cache lifetime 30s — live buys take 5-7s (tx + balance check),
+                    # so the 5s expiry was killing the cache before the position existed.
                     ws_entry = self.token_prices.get(mint)
-                    if ws_entry and (time.time() - ws_entry['timestamp']) < 5.0:
+                    if ws_entry and (time.time() - ws_entry['timestamp']) < 30.0:
                         vsr = ws_entry['virtualSolReserves']
                         vtr = ws_entry['virtualTokenReserves']
                         if vsr > 0 and vtr > 0:
                             new_price = (vsr / 1e9) / (vtr / 1e6)
+                            age = time.time() - pos['buyTime']
+                            _log.debug(f"FAST {pos['symbol']} vsr={vsr:.4e} vtr={vtr:.4e} "
+                                       f"new_price={new_price:.12e} buyPrice={pos['buyPrice']:.12e} "
+                                       f"pnl%={(new_price-pos['buyPrice'])/pos['buyPrice']*100:.2f} age={age:.1f}s")
                             self._apply_price_and_check_exits(pos, new_price)
                             continue  # Done for this position this tick
+                        else:
+                            _log.warning(f"FAST SKIP {pos['symbol']} vsr={vsr} vtr={vtr} (zero reserves)")
+                    else:
+                        cache_age = (time.time() - ws_entry['timestamp']) if ws_entry else -1
+                        _log.debug(f"NO CACHE {pos['symbol']} mint={mint[:12]} "
+                                   f"cache_exists={ws_entry is not None} cache_age={cache_age:.1f}s")
 
                     # ── SLOW PATH: Solana RPC (rate-limited) ─────────────────────────
                     now = time.time()
                     if now - self.rpc_last_call_time < self.rpc_min_interval:
-                        continue  # Rate-limit: skip this position this tick
+                        # Even without new price data, check time-based exits
+                        # (noBuysWindow, timeout) so they aren't blocked by RPC failures.
+                        age = now - pos['buyTime']
+                        if self.config['noBuysExit']:
+                            last_buy = pos.get('last_buy_time', pos['buyTime'])
+                            since_last_buy = now - last_buy
+                            if since_last_buy >= self.config['noBuysWindow']:
+                                self.execute_sell(pos, f'Dead Token (no buys in {since_last_buy:.0f}s)')
+                        elif age > 300:
+                            self.execute_sell(pos, f'Timeout (5min)')
+                        continue
                     self.rpc_last_call_time = now
 
                     coin_data = self.fetch_from_solana(mint)
@@ -1490,17 +2133,14 @@ class PumpFunSniperBot:
                         }
                         self._apply_price_and_check_exits(pos, new_price)
                     else:
-                        # Track consecutive failures
+                        # Track consecutive failures — force exit fast if no price data.
                         if mint not in self.failed_updates:
                             self.failed_updates[mint] = 0
                         self.failed_updates[mint] += 1
-                        self.add_log(
-                            f"⚠️ Failed to update {pos['symbol']} "
-                            f"({self.failed_updates[mint]}/3 attempts)", 'warning'
-                        )
-                        if self.failed_updates[mint] >= 3:
+                        age = time.time() - pos['buyTime']
+                        if self.failed_updates[mint] >= 5 or age > 30:
                             self.add_log(
-                                f"❌ {pos['symbol']} — no price data after 3 tries, FORCE CLOSING", 'error'
+                                f"❌ {pos['symbol']} — no price data ({self.failed_updates[mint]} fails, {age:.0f}s), FORCE CLOSING", 'error'
                             )
                             self.execute_sell(pos, 'Dead Token (no price data)')
 
@@ -1529,6 +2169,21 @@ class PumpFunSniperBot:
         self.winrate_label.config(text=f"{self.stats['winRate']:.1f}%")
         self.winloss_label.config(text=f"{self.stats['wins']}W / {self.stats['losses']}L / {self.stats['breakeven']}BE ({self.stats['totalTrades']} trades)")
         self.position_count.config(text=f"{len(self.positions)} open positions")
+
+        # SOL P&L card — tracks real SOL gained/lost since session start (immune to price swings)
+        if self.live_mode and self.live_trader and self.starting_sol_balance > 0:
+            try:
+                current_sol = self.live_trader.get_sol_balance()
+                sol_pnl = current_sol - self.starting_sol_balance
+                sol_color = '#0f0' if sol_pnl >= 0 else '#f00'
+                self.sol_pnl_label.config(text=f"{sol_pnl:+.4f} SOL", fg=sol_color)
+                sol_price = getattr(self, 'cached_sol_price', 190)
+                self.sol_pnl_sub.config(text=f"(${sol_pnl * sol_price:+.3f} USD)", fg=sol_color)
+            except Exception:
+                pass
+        elif self.starting_sol_balance == 0:
+            self.sol_pnl_label.config(text="0.0000 SOL", fg='#888')
+            self.sol_pnl_sub.config(text="start bot to track", fg='#555')
         
         # Update positions table
         for item in self.positions_tree.get_children():
@@ -1563,7 +2218,15 @@ class PumpFunSniperBot:
         # Update history table
         for item in self.history_tree.get_children():
             self.history_tree.delete(item)
-            
+
+        # Dynamic average % in column header
+        if self.trade_history:
+            avg_pct = sum(t['pnlPercent'] for t in self.trade_history) / len(self.trade_history)
+            avg_color = '+' if avg_pct >= 0 else ''
+            self.history_tree.heading('%', text=f"% (avg {avg_color}{avg_pct:.1f}%)")
+        else:
+            self.history_tree.heading('%', text='%')
+
         for trade in self.trade_history[:20]:
             # Use actual USD amounts if available, otherwise fall back to token prices
             buy_display = f"${trade.get('buyAmount', trade.get('amount', 0)):.4f}"

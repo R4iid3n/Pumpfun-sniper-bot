@@ -69,8 +69,8 @@ class LiveTrader:
         self.SYSVAR_RENT = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 
         # Safety limits
-        self.max_position_size_sol = 0.01  # Max 0.01 SOL per trade (matching wallet_config)
-        self.min_sol_balance = 0.02  # Keep at least 0.02 SOL for gas
+        self.max_position_size_sol = 0.2   # Max 0.2 SOL per trade (~$36 at $180/SOL, covers $5-$20 positions)
+        self.min_sol_balance = 0.005  # Keep 0.005 SOL for gas (enough for ~10 tx fees)
 
         # Additional safety - daily trade limits
         self.max_daily_trades = 20
@@ -83,6 +83,48 @@ class LiveTrader:
         # Transaction stats
         self.total_trades = 0
         self.failed_trades = 0
+
+        # ATA + token program cache keyed by mint address.
+        # Populated at buy time, consumed at sell time to skip 2 get_account_info RPCs.
+        self.token_program_cache = {}
+
+        # Blockhash cache — background thread keeps this fresh every 400ms.
+        # TX build uses the cached value instead of a blocking get_latest_blockhash RPC
+        # (~100-200ms saved per buy and per sell).
+        self._cached_blockhash = None
+        self._blockhash_lock = threading.Lock()
+        self._blockhash_thread = threading.Thread(
+            target=self._blockhash_refresher, daemon=True, name="blockhash-refresh"
+        )
+        self._blockhash_thread.start()
+
+    def _blockhash_refresher(self):
+        """Background thread: keep a fresh blockhash cached every 400ms.
+
+        Solana blockhashes expire after 150 slots (~60s at 400ms/slot).
+        Refreshing every 400ms guarantees the cached value is always valid
+        while saving one blocking RPC call (~100-200ms) per buy and per sell.
+        Falls back to a live fetch in _get_blockhash() if cache is still None.
+        """
+        while True:
+            try:
+                resp = self.client.get_latest_blockhash(commitment=Processed)
+                bh = resp.value.blockhash
+                with self._blockhash_lock:
+                    self._cached_blockhash = bh
+            except Exception:
+                pass  # Keep using previous cached value on transient RPC errors
+            time.sleep(0.4)
+
+    def _get_blockhash(self):
+        """Return cached blockhash, or fetch live if cache not yet populated."""
+        with self._blockhash_lock:
+            bh = self._cached_blockhash
+        if bh is not None:
+            return bh
+        # First call before the background thread has run — fetch directly
+        resp = self.client.get_latest_blockhash(commitment=Processed)
+        return resp.value.blockhash
 
     def _debug(self, message: str):
         """Print debug message only if verbose mode is enabled"""
@@ -316,9 +358,11 @@ class LiveTrader:
             print(f"[ERROR] Failed to get balance: {str(e)}")
             return 0.0
 
-    # Pump.fun custom error codes for slippage exceeded.
-    # Current program: buy slippage = 6001, sell slippage = 6003.
+    # Pump.fun custom error codes.
+    # Current program: bonding curve not ready = 6000, buy slippage = 6001, sell slippage = 6003.
+    BONDING_CURVE_ERROR_CODE = 6000   # bonding curve not initialized yet
     SLIPPAGE_ERROR_CODE      = 6001   # buy: too much SOL required
+    BC_COMPLETE_ERROR_CODE   = 6002   # bonding curve complete (graduated to Raydium)
     SELL_SLIPPAGE_ERROR_CODE = 6003   # sell: too little SOL received
 
     def send_transaction_with_mev_protection(self, transaction: Transaction) -> Optional[str]:
@@ -520,9 +564,10 @@ class LiveTrader:
             saving 2–7 s.  On any retry the curve is always re-fetched from chain
             so that price changes are captured.
         """
-        MAX_ATTEMPTS = 3
-        MAX_SLIPPAGE = 0.50   # hard cap — never go above 50%
-        BC_RETRIES   = 30     # Helius: 30 × 0.5s = 15s retry window (covers slow propagation)
+        MAX_ATTEMPTS  = 3
+        MAX_SLIPPAGE  = 0.50   # hard cap — never go above 50%
+        BC_RETRIES    = 30     # Helius: 30 × 0.5s = 15s retry window (covers slow propagation)
+        MAX_BC6000    = 3      # retries for error 6000 (BC not ready, 3 × 1s = 3s max)
 
         try:
             safe, reason = self.check_safety_limits(sol_amount)
@@ -531,44 +576,22 @@ class LiveTrader:
                 return None
 
             slippage = max_slippage
+            attempt = 0
+            bc6000_count = 0
+            initial_expected_tokens = None  # set on first curve read; used to detect runaway price
 
-            for attempt in range(1, MAX_ATTEMPTS + 1):
+            while attempt < MAX_ATTEMPTS:
+                attempt += 1
                 print(f"[BUY] Attempt {attempt}/{MAX_ATTEMPTS} — {sol_amount} SOL, slippage {slippage*100:.0f}%")
 
                 # Attempt 1: use pre-fetched WebSocket data if available — no RPC wait.
                 # Attempt 2+: always re-fetch from chain so price changes are captured.
                 if prefetched_curve and attempt == 1:
                     curve = prefetched_curve
-                    self._debug("Using pre-fetched curve from WS event — waiting for BC account")
-                    # Derive BC PDA from mint (used when bondingCurveKey wasn't in the WS event)
-                    bc_pda = prefetched_curve.get("bonding_curve_pda") or ""
-                    if not bc_pda:
-                        bc_pda = str(Pubkey.find_program_address(
-                            [b"bonding-curve", bytes(Pubkey.from_string(mint_address))],
-                            self.PUMPFUN_PROGRAM
-                        )[0])
-                    # Block until the BC account is visible on Helius (event-driven, not polling).
-                    # Returns immediately when the WS notification fires; falls through on timeout.
-                    appeared = self._wait_for_bc_account(bc_pda, timeout=12.0)
-                    if appeared:
-                        # WS fired on the Helius WS node, but the HTTP endpoint is a different
-                        # node in their cluster and may lag by 100-500ms.  Probe both ATAs
-                        # (SPL Token + Token-2022) until one is visible, then proceed.
-                        mint_pk  = Pubkey.from_string(mint_address)
-                        bc_pk    = Pubkey.from_string(bc_pda)
-                        ata_spl  = get_associated_token_address(bc_pk, mint_pk)
-                        ata_2022 = get_ata_with_program(bc_pk, mint_pk, TOKEN_2022_PROGRAM_ID)
-                        for _probe in range(20):  # 20 × 500ms = 10s max, ~2 RPS (safe for Helius)
-                            try:
-                                if (self.client.get_account_info(ata_spl).value or
-                                        self.client.get_account_info(ata_2022).value):
-                                    self._debug(f"ATA visible after {_probe * 500}ms HTTP lag")
-                                    break
-                            except Exception:
-                                pass
-                            time.sleep(0.5)
-                    else:
-                        self._debug("WS wait timed out — proceeding anyway (BC_RETRIES fallback active)")
+                    self._debug("Using pre-fetched curve from WS event — skipping BC wait")
+                    # WS trade event proves BC account exists. Skip logsSubscribe + ATA probe
+                    # overhead (~200-400ms). If the account isn't yet propagated to our RPC node,
+                    # the TX fails → attempt 2 falls into get_bonding_curve_state with full wait.
                 else:
                     curve = None
                     for bc in range(BC_RETRIES):
@@ -583,6 +606,14 @@ class LiveTrader:
                         return None
 
                 expected_tokens = self.calculate_buy_amount(curve, sol_amount)
+                if initial_expected_tokens is None:
+                    initial_expected_tokens = expected_tokens
+                elif initial_expected_tokens > 0 and expected_tokens < initial_expected_tokens * 0.5:
+                    # Price has risen >2× since first attempt — we're chasing, abort
+                    drift_pct = (1 - expected_tokens / initial_expected_tokens) * 100
+                    print(f"[ABORT] Price drifted {drift_pct:.0f}% since entry decision "
+                          f"({initial_expected_tokens:,.0f}→{expected_tokens:,.0f} tokens) — not chasing")
+                    return None
                 print(f"[INFO] Expected tokens: {expected_tokens:,.0f}")
 
                 sig = self.execute_pumpfun_buy(mint_address, sol_amount, slippage, curve)
@@ -604,14 +635,27 @@ class LiveTrader:
                     return sig
 
                 err_str = str(err)
-                if str(self.SLIPPAGE_ERROR_CODE) in err_str:
-                    # ❌ SlippageExceeded — double slippage and retry
+                if str(self.BONDING_CURVE_ERROR_CODE) in err_str or str(self.SLIPPAGE_ERROR_CODE) in err_str:
+                    # ❌ Price moved — error 6000 = "too much SOL required" (slippage exceeded on cost).
+                    # Pump.fun's buy instruction: amount=exact_tokens, maxSolCost=ceiling.
+                    # If price rose between curve-read and confirmation, actual cost > maxSolCost → 6000.
+                    # Fix: double slippage buffer and retry with fresh curve. No waiting needed.
+                    bc6000_count += 1
+                    if bc6000_count >= MAX_BC6000:
+                        print(f"[SLIPPAGE] Error 6000/6001 hit {bc6000_count} times — price ran too far, giving up")
+                        break
                     old = slippage
                     slippage = min(slippage * 2.0, MAX_SLIPPAGE)
-                    print(f"[SLIPPAGE] Error 6001 on attempt {attempt} — "
-                          f"raising slippage {old*100:.0f}% → {slippage*100:.0f}%")
+                    print(f"[SLIPPAGE] Error 6000/6001 ({bc6000_count}/{MAX_BC6000}) — "
+                          f"price moved, raising slippage {old*100:.0f}% → {slippage*100:.0f}%")
+                    prefetched_curve = None  # force fresh curve for new price
+                    attempt -= 1            # don't count price-move retries against MAX_ATTEMPTS
                     time.sleep(0.1)
                     continue
+                elif str(self.BC_COMPLETE_ERROR_CODE) in err_str:
+                    # ❌ Bonding curve complete — token graduated to Raydium, not retryable
+                    print(f"[BC] Error 6002 — token graduated to Raydium, skipping")
+                    return None
                 else:
                     # ❌ Other on-chain error — not retryable
                     print(f"[ERROR] On-chain failure: {err_str}")
@@ -627,24 +671,27 @@ class LiveTrader:
             self.failed_trades += 1
             return None
 
-    def sell_token_pumpfun(self, mint_address: str, token_amount: float, max_slippage: float = 0.05) -> Optional[str]:
+    def sell_token_pumpfun(self, mint_address: str, token_amount: float, max_slippage: float = 0.05,
+                           skip_balance_check: bool = False, cached_curve: dict = None) -> Optional[str]:
         """Sell a token on the Pump.fun bonding curve with automatic slippage retry.
 
         Sell strategy escalates aggressively — getting OUT is more important than price:
           Attempt 1: min_sol = expected * (1 - slippage)
           Attempt 2: min_sol = expected * (1 - slippage*2)   [double tolerance]
           Attempt 3: min_sol = 0   [emergency — accept any price to close position]
+        cached_curve: pre-built curve dict from WS cache — skips bonding curve RPC on attempt 1.
         """
         MAX_ATTEMPTS = 3
 
         try:
-            # Verify we actually hold the tokens
-            balance = self.get_token_balance(mint_address)
-            if balance <= 0:
-                print(f"[ERROR] No token balance to sell for {mint_address[:8]}")
-                return None
-            # Sell whatever we hold (in case partial sell happened before)
-            token_amount = min(token_amount, balance)
+            if not skip_balance_check:
+                # Verify we actually hold the tokens
+                balance = self.get_token_balance(mint_address)
+                if balance <= 0:
+                    print(f"[ERROR] No token balance to sell for {mint_address[:8]}")
+                    return None
+                # Sell whatever we hold (in case partial sell happened before)
+                token_amount = min(token_amount, balance)
 
             slippage = max_slippage
 
@@ -652,8 +699,13 @@ class LiveTrader:
                 print(f"[SELL] Attempt {attempt}/{MAX_ATTEMPTS} — "
                       f"{token_amount:,.2f} tokens, slippage {slippage*100:.0f}%")
 
-                # Fresh bonding curve quote every attempt
-                curve = self.get_bonding_curve_state(mint_address)
+                # Use WS-cached curve on first attempt to skip RPC (~100-300ms saved).
+                # Fall back to fresh RPC fetch on retries (slippage error = stale price).
+                if attempt == 1 and cached_curve:
+                    curve = cached_curve
+                    print(f"[SELL] Using cached curve (vsr={curve['virtual_sol_reserves']:.3e})")
+                else:
+                    curve = self.get_bonding_curve_state(mint_address)
                 if not curve:
                     print("[ERROR] Bonding curve unavailable — token may have migrated to Raydium")
                     return None
@@ -1002,9 +1054,8 @@ class LiveTrader:
                 instructions.append(tip_instruction)
                 print(f"[MEV] Added Jito tip: {self.jito_tip_lamports} lamports")
 
-            # Get recent blockhash at processed commitment — fastest available blockhash
-            blockhash_resp = self.client.get_latest_blockhash(commitment=Processed)
-            recent_blockhash = blockhash_resp.value.blockhash
+            # Use pre-cached blockhash (background thread refreshes every 400ms)
+            recent_blockhash = self._get_blockhash()
 
             # Build message
             message = Message.new_with_blockhash(
@@ -1029,6 +1080,12 @@ class LiveTrader:
             if not signature:
                 return None
 
+            # Cache ATA + token program for fast sell — skips 2 get_account_info RPCs
+            self.token_program_cache[mint_address] = {
+                'user_ata': user_token_account,
+                'token_program': mint_token_program,
+            }
+
             # Confirmation is handled by get_tx_error() in buy_token_pumpfun
             # (polls every 0.5s up to 6s) — no need to block here too.
             return signature
@@ -1052,10 +1109,9 @@ class LiveTrader:
                 self.PUMPFUN_PROGRAM
             )
 
-            # Detect which token program this mint uses by checking which user ATA
-            # actually holds the tokens.  Some pump.fun tokens (mints ending in "pump")
-            # use Token-2022; others use legacy SPL Token.  Using the wrong program
-            # causes pump.fun to reject the sell with a custom error.
+            # Detect which token program this mint uses.
+            # Fast path: use ATA cached at buy time — skips 2 get_account_info RPCs (~200-400ms).
+            # Cold path (cache miss): probe both ATAs as before.
             ata_spl  = get_associated_token_address(self.keypair.pubkey(), mint_pubkey)
             ata_2022 = get_ata_with_program(self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID)
 
@@ -1063,27 +1119,35 @@ class LiveTrader:
             mint_token_program  = TOKEN_PROGRAM_ID  # default
             exact_raw_balance   = None             # exact on-chain u64 token amount
 
-            try:
-                resp = self.client.get_account_info(ata_2022, commitment=Processed)
-                if resp.value and resp.value.data and len(resp.value.data) >= 72:
-                    amount = int.from_bytes(resp.value.data[64:72], 'little')
-                    if amount > 0:
-                        user_token_account = ata_2022
-                        mint_token_program  = TOKEN_2022_PROGRAM_ID
-                        exact_raw_balance   = amount
-            except Exception:
-                pass
-
-            # If tokens weren't in Token-2022 ATA, probe SPL ATA for exact balance
-            if exact_raw_balance is None:
+            _cached_ata = self.token_program_cache.get(mint_address)
+            if _cached_ata:
+                # Fast path: token program determined at buy time
+                user_token_account = _cached_ata['user_ata']
+                mint_token_program  = _cached_ata['token_program']
+                print(f"[SELL] Cached ATA hit — skipped 2 probes")
+            else:
+                # Cold path: probe which ATA holds the tokens
                 try:
-                    resp_spl = self.client.get_account_info(ata_spl, commitment=Processed)
-                    if resp_spl.value and resp_spl.value.data and len(resp_spl.value.data) >= 72:
-                        amount_spl = int.from_bytes(resp_spl.value.data[64:72], 'little')
-                        if amount_spl > 0:
-                            exact_raw_balance = amount_spl
+                    resp = self.client.get_account_info(ata_2022, commitment=Processed)
+                    if resp.value and resp.value.data and len(resp.value.data) >= 72:
+                        amount = int.from_bytes(resp.value.data[64:72], 'little')
+                        if amount > 0:
+                            user_token_account = ata_2022
+                            mint_token_program  = TOKEN_2022_PROGRAM_ID
+                            exact_raw_balance   = amount
                 except Exception:
                     pass
+
+                # If tokens weren't in Token-2022 ATA, probe SPL ATA for exact balance
+                if exact_raw_balance is None:
+                    try:
+                        resp_spl = self.client.get_account_info(ata_spl, commitment=Processed)
+                        if resp_spl.value and resp_spl.value.data and len(resp_spl.value.data) >= 72:
+                            amount_spl = int.from_bytes(resp_spl.value.data[64:72], 'little')
+                            if amount_spl > 0:
+                                exact_raw_balance = amount_spl
+                    except Exception:
+                        pass
 
             # Bonding curve ATA — same program as the mint
             if mint_token_program == TOKEN_2022_PROGRAM_ID:
@@ -1174,8 +1238,7 @@ class LiveTrader:
             ]
 
             # Build and sign transaction (same pattern as buy)
-            blockhash_resp = self.client.get_latest_blockhash(commitment=Processed)
-            recent_blockhash = blockhash_resp.value.blockhash
+            recent_blockhash = self._get_blockhash()  # pre-cached, no RPC wait
 
             message = Message.new_with_blockhash(
                 instructions,
