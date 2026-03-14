@@ -8,9 +8,16 @@
 
   "max_slippage_bps": 500,
   "priority_fee_lamports": 100000,
-  "compute_unit_limit": 200000,
+  "buy_compute_unit_limit": 100000,
+  "sell_compute_unit_limit": 70000,
 
   "use_jito_mev_protection": false,
   "jito_tip_lamports": 100000,
-  "jito_block_engine_url": "https://mainnet.block-engine.jito.wtf"
+  "jito_block_engine_url": "https://mainnet.block-engine.jito.wtf",
+
+  "nextblock_api_key": "",
+  "nextblock_tip_lamports": 1000000,
+
+  "nozomi_api_key": "",
+  "nozomi_tip_lamports": 1000000
 }

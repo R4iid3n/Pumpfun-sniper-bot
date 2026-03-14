@@ -1,5 +1,6 @@
 # ── Secrets — NEVER commit these ──────────────────────────────────────────────
 wallet_config.json
+rpc_urls.txt
 *.key
 *.pem
 .env

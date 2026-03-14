@@ -915,20 +915,32 @@ class PumpFunSniperBot:
                     pnl_pct = ((price - pos['buyPrice']) / pos['buyPrice']) * 100
                     consec = pos.get('consecutive_sells', 0)
                     slip = self.config.get('latencySlippagePct', 2)  # execution slippage buffer
+                    _trade_count = pos.get('_trade_event_count', 0) + 1
+                    pos['_trade_event_count'] = _trade_count
+
+                    # FIRST-SELL PROTECTION: if the very first trade event after entry
+                    # is a sell that drops >3%, exit immediately. This is the #1 bait pattern:
+                    # buy → bot enters → instant massive sell. AXIOMGATE: -17.5% on first sell.
+                    # Catching at -3% saves ~14% vs waiting for emergency stop.
+                    if _trade_count <= 2 and tx == 'sell' and pnl_pct <= -3:
+                        pos['_selling'] = True
+                        pos['_urgent_price'] = price
+                        pos['_urgent_reason'] = 'First-Sell Dump'
+                        _log.info(f"FIRST_SELL_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% — dump on trade #{_trade_count} after entry")
 
                     # All thresholds shifted by slippage to account for ~2s execution delay.
                     # Losses: trigger earlier (less negative) so actual exit ≈ intended level.
                     # Profits: require higher profit so actual exit is still profitable.
-                    if pnl_pct <= -(10 - slip):  # -8% trigger → ~-10% actual
+                    if pnl_pct <= -(5 + slip):  # -7% trigger → ~-9% actual (was -8% → -17%)
                         pos['_selling'] = True
                         pos['_urgent_price'] = price
                         pos['_urgent_reason'] = 'Emergency Stop'
-                        _log.info(f"EMERGENCY_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% — absolute floor (trigger -{10-slip}%)")
-                    elif pnl_pct <= -(8 - slip) and consec >= 2:  # -6% trigger → ~-8% actual
+                        _log.info(f"EMERGENCY_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% — absolute floor (trigger -{5+slip}%)")
+                    elif pnl_pct <= -(4 + slip) and consec >= 1:  # -6% trigger w/ 1 sell → ~-8% actual
                         pos['_selling'] = True
                         pos['_urgent_price'] = price
                         pos['_urgent_reason'] = 'Hard Stop'
-                        _log.info(f"URGENT_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% sells={consec} (trigger -{8-slip}%)")
+                        _log.info(f"URGENT_EXIT {pos['symbol']} pnl={pnl_pct:.1f}% sells={consec} (trigger -{4+slip}%)")
                     # MOMENTUM EXIT: profitable + sells starting → lock in gains.
                     # Raised from 2 consec/+4% → 3 consec/+8% to let big runners breathe past early sell waves.
                     elif pnl_pct >= (6 + slip) and consec >= 3:  # +8% trigger → ~+6% actual
@@ -967,16 +979,20 @@ class PumpFunSniperBot:
                     pending['buy_count'] = pending.get('buy_count', 0) + 1
                     if 'first_buy_time' not in pending:
                         pending['first_buy_time'] = time.time()  # track when buying actually started
-                    pending.setdefault('buy_times', []).append(time.time())
-                    if len(pending['buy_times']) > 8:
-                        pending['buy_times'].pop(0)
+                    # Track unique buyer wallets — blocks single-wallet bait pumps.
+                    _buyer_wallet = data.get('traderPublicKey', '')
+                    if _buyer_wallet:
+                        pending.setdefault('unique_buyers', set()).add(_buyer_wallet)
                     # Track largest single buy in SOL (vsr delta between events).
-                    # A single buy >0.80 SOL is a whale pumping to bait bots — even if later
+                    # A single buy >0.50 SOL is a whale pumping to bait bots — even if later
                     # smaller buys bring the average down, the initial whale is likely the dumper.
                     _prev_vsr = pending.get('last_vsr', pending['creation_vsr'])
                     _single_buy_sol = (vsr - _prev_vsr) / 1e9
                     if _single_buy_sol > pending.get('max_single_buy', 0):
                         pending['max_single_buy'] = _single_buy_sol
+                    # Track (timestamp, sol_amount) pairs for acceleration scoring.
+                    # Kept unbounded (max ~15 buys in a 15s entry window).
+                    pending.setdefault('buy_events', []).append((time.time(), max(_single_buy_sol, 0)))
                 pending['last_vsr'] = vsr  # update every event (buy or sell)
                 if tx_type == 'sell':
                     pending['sell_count'] = pending.get('sell_count', 0) + 1
@@ -996,21 +1012,61 @@ class PumpFunSniperBot:
                     if len(recent) > 5:
                         recent.pop(0)
 
-                # Buy acceleration: compare first-half vs second-half buy rate.
-                # Decelerating buy momentum = crowd already leaving = likely dead token.
-                # Requires 4+ buy events; defaults to True (pass) when insufficient data.
-                _buy_times = pending.get('buy_times', [])
+                # Buy momentum scoring — three independent signals combined.
+                # Each signal produces a 0-1 score; the token passes if the weighted
+                # average stays above 0.4 (tunable).
+                # Works with 2+ buy events (fast lane needs scores at 2 buys).
+                _buy_events = pending.get('buy_events', [])  # [(timestamp, sol_amount), ...]
                 _is_accelerating = True
-                _accel_ratio = None
-                if len(_buy_times) >= 4:
-                    _mid = len(_buy_times) // 2
-                    _sf = max(_buy_times[_mid - 1] - _buy_times[0], 0.001)
-                    _ss = max(_buy_times[-1]        - _buy_times[_mid], 0.001)
-                    _rf = (_mid - 1) / _sf if _mid > 1 else 0
-                    _rs = (len(_buy_times) - _mid - 1) / _ss if (len(_buy_times) - _mid) > 1 else 0
-                    if _rf > 0:
-                        _accel_ratio = _rs / _rf
-                        _is_accelerating = _accel_ratio >= 0.5  # second half ≥ 50% as fast as first
+                _accel_score = None
+                _freq_score = None
+                _vol_score = None
+                _gap_score = None
+                if len(_buy_events) >= 2:
+                    # --- Signal 1: Frequency acceleration (are buys speeding up?) ---
+                    # Needs 3+ events for a meaningful split; with 2, give neutral score.
+                    if len(_buy_events) >= 3:
+                        _mid = len(_buy_events) // 2
+                        _t_first = [e[0] for e in _buy_events[:_mid]]
+                        _t_second = [e[0] for e in _buy_events[_mid:]]
+                        _span_first = max(_t_first[-1] - _t_first[0], 0.001) if len(_t_first) > 1 else 0.001
+                        _span_second = max(_t_second[-1] - _t_second[0], 0.001) if len(_t_second) > 1 else 0.001
+                        _rate_first = (len(_t_first) - 1) / _span_first if len(_t_first) > 1 else 0
+                        _rate_second = (len(_t_second) - 1) / _span_second if len(_t_second) > 1 else 0
+                        _freq_ratio = _rate_second / _rate_first if _rate_first > 0 else 1.0
+                        _freq_score = min(_freq_ratio / 0.5, 1.0)
+                    else:
+                        _freq_score = 0.7  # neutral-positive for 2-buy tokens
+
+                    # --- Signal 2: Volume check (are buys decent size?) ---
+                    # With 3+: compare first-half vs second-half avg SOL.
+                    # With 2: check both buys are above minimum (0.07 SOL).
+                    if len(_buy_events) >= 3:
+                        _mid = len(_buy_events) // 2
+                        _sol_first = [e[1] for e in _buy_events[:_mid]]
+                        _sol_second = [e[1] for e in _buy_events[_mid:]]
+                        _avg_sol_first = sum(_sol_first) / max(len(_sol_first), 1)
+                        _avg_sol_second = sum(_sol_second) / max(len(_sol_second), 1)
+                        _vol_ratio = _avg_sol_second / _avg_sol_first if _avg_sol_first > 0 else 1.0
+                        _vol_score = min(_vol_ratio / 0.5, 1.0)
+                    else:
+                        # 2 events: score based on whether both buys are solid size
+                        _min_sol = min(e[1] for e in _buy_events)
+                        _vol_score = min(_min_sol / 0.10, 1.0)  # 1.0 if smallest buy ≥ 0.10 SOL
+
+                    # --- Signal 3: Last-buy gap freshness (is momentum still alive?) ---
+                    # Compare time since last buy vs average inter-buy gap.
+                    # If last gap > 3× average, momentum is dead.
+                    _gaps = [_buy_events[i+1][0] - _buy_events[i][0] for i in range(len(_buy_events)-1)]
+                    _avg_gap = sum(_gaps) / len(_gaps) if _gaps else 1.0
+                    _last_gap = time.time() - _buy_events[-1][0]
+                    _gap_ratio = _last_gap / max(_avg_gap, 0.001)
+                    _gap_score = max(1.0 - (_gap_ratio - 1.0) / 2.0, 0.0)  # 1.0 at ≤1×, 0.0 at ≥3×
+
+                    # --- Combined weighted score ---
+                    # Frequency 35%, volume 35%, gap freshness 30%.
+                    _accel_score = 0.35 * _freq_score + 0.35 * _vol_score + 0.30 * _gap_score
+                    _is_accelerating = _accel_score >= 0.4
 
                 # Acceleration is used as a blocking filter only (rejects decelerating tokens).
                 # Entry thresholds are fixed — lowering them for fast accel let rugs through (MILANO -17.5%).
@@ -1038,24 +1094,24 @@ class PumpFunSniperBot:
                     # Late entry disabled — TX takes ~3s, token peaked by confirmation time.
                     # Losses: CHEEZYCA -4%, Kiki -12.9%, ACE -3.4%, Coprolite -6.1%
                     pass
-                elif (price_gain >= 3
-                      and pending.get('buy_count', 0) >= 1 and sol_volume >= 0.4
+                elif (price_gain >= 2
                       and pending.get('sell_count', 0) < pending.get('buy_count', 0)
                       and pending.get('recent_txs', []).count('sell') < 2
                       and pending.get('max_sell_drop', 0) < 1.5
-                      and pending.get('max_single_buy', 0) <= 0.65
+                      and pending.get('max_single_buy', 0) <= 0.50
                       and tx_type == 'buy'
                       and (sol_volume / max(pending.get('buy_count', 1), 1)) <= 0.50
                       and (sol_volume / max(pending.get('buy_count', 1), 1)) >= 0.07
                       and (time.time() - pending['created']) >= 1.5
                       and (time.time() - pending['created']) <= 15
-                      and _is_accelerating):
-                    # ENTRY: min gain 3%, min 1 buy, vol ≥ 0.4 SOL, avg buy 0.06–0.50 SOL, age 1.5–15s.
-                    # avg_buy ≤ 0.50: blocks pure mega-whale pumps (>0.50 SOL avg).
-                    # avg_buy ≥ 0.07: blocks bot-farmed volume (Javis 0.055 -9.7%, CITY 0.061 -6.5%).
-                    # max_single_buy ≤ 0.65: blocks bait-and-dump — one whale pumps >0.65 SOL to pump
-                    #   price, then places smaller buys to normalize avg, then dumps after bots enter.
-                    #   Caught: Shit (1.21 SOL first buy -7.2%), RAGENALD (0.664 SOL first buy -10.1%).
+                      and _is_accelerating
+                      and sol_volume >= 0.25
+                      and pending.get('buy_count', 0) >= 3):
+                    # ENTRY: gain ≥2%, 3+ buys, age 1.5-15s, avg buy 0.07-0.50, momentum OK.
+                    # Fast lane removed — 2-buy entries were Sybil-gamed (AXIOMGATE -17.5%:
+                    #   1 person used 2 wallets to fake organic demand, then dumped instantly).
+                    # 3 buys is the minimum for meaningful momentum/volume scoring.
+                    # max_single_buy ≤ 0.50: blocks bait-and-dump whale pumps.
                     # sell_dump<1.5%: blocks entries where a whale already dumped during monitoring.
                     # recent_txs: skip if 2+ of last 5 trades are sells (momentum cooling).
                     pending.pop('_near_miss_logged', None)  # clear flag on actual entry
@@ -1069,10 +1125,11 @@ class PumpFunSniperBot:
                         coin['prefetched_curve']['virtual_sol_reserves'] = int(vsr)
                         coin['prefetched_curve']['virtual_token_reserves'] = int(vtr)
                     wait_time = time.time() - pending['created']
-                    self.add_log(f"🚀 EARLY ENTRY: {coin['symbol']} +{price_gain:.1f}% | {pending['buy_count']} buys | {sol_volume:.2f} SOL vol | {wait_time:.1f}s", 'success')
+                    _n_wallets = len(pending.get('unique_buyers', set()))
+                    self.add_log(f"🚀 EARLY ENTRY: {coin['symbol']} +{price_gain:.1f}% | {pending['buy_count']} buys | {_n_wallets} wallets | {sol_volume:.2f} SOL vol | {wait_time:.1f}s", 'success')
                     _log.info(f"PENDING_TRIGGER {coin['symbol']} mint={mint[:12]} "
                               f"waited={wait_time:.1f}s price={coin['price']:.12e} "
-                              f"gain={price_gain:.1f}% buys={pending['buy_count']} vol={sol_volume:.2f}")
+                              f"gain={price_gain:.1f}% buys={pending['buy_count']} wallets={_n_wallets} vol={sol_volume:.2f}")
 
                     # Re-check we still have capacity and capital
                     if (len(self.positions) < self.config['maxOpenPositions'] and
@@ -1090,7 +1147,7 @@ class PumpFunSniperBot:
                             "method": "unsubscribeTokenTrade",
                             "keys": [mint]
                         })
-                elif price_gain >= 3 and tx_type == 'buy' and not pending.get('_near_miss_logged'):
+                elif price_gain >= 2 and tx_type == 'buy' and not pending.get('_near_miss_logged'):
                     # Token hit gain threshold but failed other entry conditions.
                     # Log once per token so we can diagnose which filter is too strict.
                     pending['_near_miss_logged'] = True
@@ -1099,23 +1156,28 @@ class PumpFunSniperBot:
                     recent_sells = pending.get('recent_txs', []).count('sell')
                     avg_buy = sol_volume / max(buy_count, 1)
                     reasons = []
-                    if buy_count < 1:                        reasons.append(f"buys={buy_count}<1")
-                    if sol_volume < 0.4:                     reasons.append(f"vol={sol_volume:.2f}<0.4")
+                    _unique_wallets = len(pending.get('unique_buyers', set()))
+                    if buy_count < 3:                        reasons.append(f"buys={buy_count}<3")
+                    if sol_volume < 0.25:                    reasons.append(f"vol={sol_volume:.2f}<0.25")
                     if recent_sells >= 2:                    reasons.append(f"recent_sells={recent_sells}/5")
                     if avg_buy > 0.50:                       reasons.append(f"avg_buy={avg_buy:.3f}>0.50")
                     if sell_count >= buy_count:              reasons.append(f"sells({sell_count})>=buys({buy_count})")
                     _sell_drop = pending.get('max_sell_drop', 0)
                     if _sell_drop >= 1.5:                    reasons.append(f"sell_dump={_sell_drop:.1f}%>1.5%")
                     _max_single = pending.get('max_single_buy', 0)
-                    if _max_single > 0.65:                   reasons.append(f"single_buy={_max_single:.2f}SOL>0.65")
+                    if _max_single > 0.50:                   reasons.append(f"single_buy={_max_single:.2f}SOL>0.50")
                     if avg_buy < 0.07:                       reasons.append(f"avg_buy={avg_buy:.3f}<0.07(bot_farm)")
                     token_age = time.time() - pending['created']
                     if token_age < 1.5:                      reasons.append(f"token_age={token_age:.1f}s<1.5s(too_fresh)")
                     if token_age > 15:                       reasons.append(f"token_age={token_age:.0f}s>15s")
-                    if _accel_ratio is not None and not _is_accelerating: reasons.append(f"decel={_accel_ratio:.2f}<0.5")
+                    if _accel_score is not None and not _is_accelerating: reasons.append(f"momentum={_accel_score:.2f}<0.4")
                     reason_str = ', '.join(reasons) if reasons else 'unknown'
-                    _log.info(f"NEAR_MISS {pending['coin']['symbol']} gain={price_gain:.1f}% buys={buy_count} vol={sol_volume:.2f} — {reason_str}")
-                    self.add_log(f"⚡ near miss: {pending['coin']['symbol']} +{price_gain:.1f}% — {reason_str}", 'info')
+                    # Always log to debug file for post-session analysis
+                    _log.info(f"NEAR_MISS {pending['coin']['symbol']} gain={price_gain:.1f}% buys={buy_count} vol={sol_volume:.2f} wallets={_unique_wallets} — {reason_str}")
+                    # Only show in GUI if truly close to entering (≤2 failing filters).
+                    # Tokens failing 3+ filters are noise, not near misses.
+                    if len(reasons) <= 2:
+                        self.add_log(f"⚡ near miss: {pending['coin']['symbol']} +{price_gain:.1f}% — {reason_str}", 'info')
 
     def handle_new_coin(self, data):
         # Sanitize symbol/name — PumpPortal sends Unicode/emojis that crash Windows console
@@ -1236,12 +1298,25 @@ class PumpFunSniperBot:
                         'creation_vsr': coin.get('liquidity', 30) * 1e9,  # SOL reserves at creation (lamports)
                         'buy_count': 0,
                         'sell_count': 0,
-                        'buy_times': [],
+                        'buy_events': [],  # [(timestamp, sol_amount), ...] for momentum scoring
                     }
                     self.ws_command_queue.put({
                         "method": "subscribeTokenTrade",
                         "keys": [coin['mint']]
                     })
+
+                    # Prebuild TX context in background thread — derives PDAs + probes
+                    # ATA existence during the 1.5-15s monitoring window so that when
+                    # the momentum trigger fires, execute_pumpfun_buy skips ~300ms.
+                    if self.live_mode and self.live_trader and coin.get('prefetched_curve'):
+                        import threading as _thr
+                        _thr.Thread(
+                            target=self.live_trader.prebuild_buy_context,
+                            args=(coin['mint'], coin['prefetched_curve']),
+                            daemon=True,
+                            name=f"prebuild-{coin['mint'][:8]}"
+                        ).start()
+
                     self.add_log(f"👀 WATCHING {coin['symbol']} — waiting for first buy...", 'info')
                 elif not risk['safe']:
                     failing = [r for r in risk['risks'] if r.startswith('❌') or r.startswith('⚠️')]
@@ -1940,18 +2015,18 @@ class PumpFunSniperBot:
 
         # All loss thresholds shifted by slippage: trigger earlier so actual exit ≈ intended.
         # All profit thresholds shifted by slippage: require more profit so actual exit is still green.
-        if pos['pnlPercent'] <= -(10 - slip):  # -8% trigger → ~-10% actual
+        if pos['pnlPercent'] <= -(5 + slip):  # -7% trigger → ~-9% actual
             self.add_log(f"🛑 EMERGENCY STOP: {pos['pnlPercent']:.1f}%!", 'error')
             self.execute_sell(pos, f'Emergency Stop ({pos["pnlPercent"]:.1f}%)')
             return True
 
         consec = pos.get('consecutive_sells', 0)
-        if pos['pnlPercent'] <= -(8 - slip) and consec >= 2:  # -6% trigger → ~-8% actual
+        if pos['pnlPercent'] <= -(4 + slip) and consec >= 1:  # -6% trigger w/ 1 sell → ~-8% actual
             self.add_log(f"🛑 HARD STOP: {pos['pnlPercent']:.1f}% ({consec} sells) - EXIT!", 'error')
             self.execute_sell(pos, f'Hard Stop ({pos["pnlPercent"]:.1f}%)')
             return True
 
-        if age <= 5 and pos['pnlPercent'] <= -(5 - slip) and consec >= 2:  # -3% trigger → ~-5% actual
+        if age <= 5 and pos['pnlPercent'] <= -(3 + slip) and consec >= 1:  # -5% trigger w/ 1 sell → ~-7%
             self.add_log(f"💀 INSTANT RUG: {pos['pnlPercent']:.1f}% in {age:.0f}s - EXIT NOW!", 'error')
             self.execute_sell(pos, f'Instant Rug ({pos["pnlPercent"]:.1f}% in {age:.0f}s)')
             return True
@@ -2013,8 +2088,9 @@ class PumpFunSniperBot:
                 return True
 
         # FAST SCALP: Take quick profit in first 15s while momentum is hot.
-        # Target: lock in +8% before the dump. MOMENTUM_EXIT now raised to +8% so we're not cut at +4% first.
-        if age <= 15 and pos['pnlPercent'] >= 8:
+        # Target: lock in +5% before the dump. Most tokens briefly hit +5% then reverse —
+        # catching these small wins more often improves win rate even if each win is smaller.
+        if age <= 15 and pos['pnlPercent'] >= 5:
             self.add_log(f"⚡ FAST SCALP! +{pos['pnlPercent']:.1f}% in {age:.0f}s", 'success')
             self.execute_sell(pos, f'Fast Scalp (+{pos["pnlPercent"]:.1f}% in {age:.0f}s)')
             return True

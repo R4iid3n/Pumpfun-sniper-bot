@@ -88,6 +88,11 @@ class LiveTrader:
         # Populated at buy time, consumed at sell time to skip 2 get_account_info RPCs.
         self.token_program_cache = {}
 
+        # Prebuild cache — populated at token detection time (handle_new_coin),
+        # consumed at buy trigger time (execute_pumpfun_buy) to skip ~300ms of
+        # RPC probes (BC ATA detection + user ATA existence check).
+        self._prebuild_cache = {}
+
         # Blockhash cache — background thread keeps this fresh every 400ms.
         # TX build uses the cached value instead of a blocking get_latest_blockhash RPC
         # (~100-200ms saved per buy and per sell).
@@ -125,6 +130,123 @@ class LiveTrader:
         # First call before the background thread has run — fetch directly
         resp = self.client.get_latest_blockhash(commitment=Processed)
         return resp.value.blockhash
+
+    def prebuild_buy_context(self, mint_address: str, prefetched_curve: Optional[Dict] = None):
+        """Pre-derive all PDAs and probe ATA existence for a mint.
+
+        Called at token detection time (handle_new_coin) so that when the
+        momentum trigger fires, execute_pumpfun_buy can skip ~300ms of RPC
+        probes and jump straight to instruction assembly + sign + blast.
+
+        Safe to call from a background thread.  Results are cached in
+        self._prebuild_cache[mint_address].
+        """
+        try:
+            mint_pubkey = Pubkey.from_string(mint_address)
+
+            # 1. Derive bonding curve PDA (deterministic, no RPC)
+            bonding_curve_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # 2. Derive creator_vault PDA (needs creator pubkey from prefetched_curve)
+            creator_vault = None
+            if prefetched_curve and prefetched_curve.get('creator'):
+                creator_pubkey = prefetched_curve['creator']
+                creator_vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
+
+            # 3. Derive user volume accumulator PDA (deterministic, no RPC)
+            user_volume_accumulator, _ = Pubkey.find_program_address(
+                [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # 4. Probe BC ATAs to detect token program (2 RPC calls, ~200ms)
+            associated_bonding_curve_legacy = get_associated_token_address(
+                bonding_curve_pda, mint_pubkey
+            )
+            associated_bonding_curve_2022 = get_ata_with_program(
+                bonding_curve_pda, mint_pubkey, TOKEN_2022_PROGRAM_ID
+            )
+
+            associated_bonding_curve = None
+            mint_token_program = TOKEN_PROGRAM_ID  # default
+
+            try:
+                bc_ata_info = self.client.get_account_info(associated_bonding_curve_legacy)
+                if bc_ata_info.value:
+                    associated_bonding_curve = associated_bonding_curve_legacy
+                    mint_token_program = TOKEN_PROGRAM_ID
+            except Exception:
+                pass
+
+            if not associated_bonding_curve:
+                try:
+                    bc_ata_info = self.client.get_account_info(associated_bonding_curve_2022)
+                    if bc_ata_info.value:
+                        associated_bonding_curve = associated_bonding_curve_2022
+                        mint_token_program = TOKEN_2022_PROGRAM_ID
+                except Exception:
+                    pass
+
+            # 5. Derive user token account + check existence (1 RPC call, ~100ms)
+            if mint_token_program == TOKEN_2022_PROGRAM_ID:
+                user_token_account = get_ata_with_program(
+                    self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID
+                )
+            else:
+                user_token_account = get_associated_token_address(
+                    self.keypair.pubkey(), mint_pubkey
+                )
+
+            needs_ata_creation = False
+            create_ata_ix = None
+            try:
+                user_ata_info = self.client.get_account_info(user_token_account)
+                if not user_ata_info.value:
+                    needs_ata_creation = True
+            except Exception:
+                needs_ata_creation = True  # assume missing if check fails
+
+            if needs_ata_creation:
+                create_ata_ix = Instruction(
+                    program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+                    accounts=[
+                        AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),
+                        AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
+                        AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=False),
+                        AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+                        AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),
+                    ],
+                    data=b"",
+                )
+
+            ctx = {
+                'bonding_curve_pda': bonding_curve_pda,
+                'creator_vault': creator_vault,
+                'user_volume_accumulator': user_volume_accumulator,
+                'associated_bonding_curve': associated_bonding_curve,
+                'user_token_account': user_token_account,
+                'mint_token_program': mint_token_program,
+                'needs_ata_creation': needs_ata_creation,
+                'create_ata_ix': create_ata_ix,
+                'timestamp': time.time(),
+            }
+            self._prebuild_cache[mint_address] = ctx
+            self._debug(f"Prebuild OK for {mint_address[:8]}... "
+                        f"(bc_ata={'found' if associated_bonding_curve else 'missing'}, "
+                        f"user_ata={'create' if needs_ata_creation else 'exists'}, "
+                        f"program={'2022' if mint_token_program == TOKEN_2022_PROGRAM_ID else 'SPL'})")
+            return ctx
+
+        except Exception as e:
+            self._debug(f"Prebuild failed for {mint_address[:8]}...: {e}")
+            return None
 
     def _debug(self, message: str):
         """Print debug message only if verbose mode is enabled"""
@@ -332,14 +454,34 @@ class LiveTrader:
             self.rpc_url = config.get('rpc_url', 'https://api.mainnet-beta.solana.com')
             self.max_slippage_bps = config.get('max_slippage_bps', 500)  # 5% default
             self.priority_fee = config.get('priority_fee_lamports', 100000)  # 0.0001 SOL
-            self.compute_limit = config.get('compute_unit_limit', 200000)
+            self.buy_compute_limit = config.get('buy_compute_unit_limit', 100000)
+            self.sell_compute_limit = config.get('sell_compute_unit_limit', 70000)
 
             # MEV Protection settings
             self.use_jito = config.get('use_jito_mev_protection', False)
             self.jito_tip_lamports = config.get('jito_tip_lamports', 10000)  # 0.00001 SOL tip
             self.jito_block_engine_url = config.get('jito_block_engine_url', 'https://mainnet.block-engine.jito.wtf')
 
+            # NextBlock settings (closest region to your VPS)
+            self.nextblock_api_key = config.get('nextblock_api_key', '')
+            self.nextblock_region = config.get('nextblock_region', 'london')
+            self.nextblock_tip_lamports = config.get('nextblock_tip_lamports', 100_000)
+            self.nextblock_only = config.get('nextblock_only', False)  # send ONLY via NextBlock (test mode)
+
+            # Nozomi / Temporal settings (Frankfurt endpoint)
+            self.nozomi_api_key = config.get('nozomi_api_key', '')
+            self.nozomi_tip_lamports = config.get('nozomi_tip_lamports', 1_000_000)  # 0.001 SOL min
+
             print(f"[OK] Wallet loaded: {self.wallet_address}")
+            blast_endpoints = ['RPC']
+            if self.use_jito:
+                blast_endpoints.append('Jito')
+            if self.nextblock_api_key:
+                blast_endpoints.append('NextBlock')
+            if self.nozomi_api_key:
+                blast_endpoints.append('Nozomi')
+            if len(blast_endpoints) > 1:
+                print(f"[BLAST] Multi-endpoint blast: {', '.join(blast_endpoints)}")
             if self.use_jito:
                 print(f"[MEV] MEV Protection: ENABLED (Jito)")
 
@@ -468,6 +610,133 @@ class LiveTrader:
         except Exception as e:
             print(f"[ERROR] RPC send failed: {str(e)}")
             return None
+
+    def _send_via_nextblock(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction via NextBlock Frankfurt endpoint.
+
+        Uses base64 encoding and NextBlock's REST API.
+        Requires nextblock_api_key to be configured.
+        """
+        try:
+            import base64
+            serialized_tx = bytes(transaction)
+            tx_b64 = base64.b64encode(serialized_tx).decode('utf-8')
+
+            url = f"https://{self.nextblock_region}.nextblock.io/api/v2/submit"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": self.nextblock_api_key,
+            }
+            data = {
+                "transaction": {"content": tx_b64},
+                "frontRunningProtection": False,
+            }
+
+            response = requests.post(url, json=data, headers=headers, timeout=5)
+            if response.status_code == 200:
+                result = response.json()
+                sig = result.get("signature")
+                if sig:
+                    print(f"[NEXTBLOCK] TX: {sig}")
+                    return sig
+                print(f"[WARN] NextBlock no signature in response: {result}")
+                return None
+            else:
+                print(f"[WARN] NextBlock HTTP {response.status_code}: {response.text[:200]}")
+                return None
+        except Exception as e:
+            print(f"[WARN] NextBlock failed: {str(e)}")
+            return None
+
+    def _send_via_nozomi(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction via Nozomi (Temporal) Frankfurt endpoint.
+
+        Uses standard Solana JSON-RPC sendTransaction with base64 encoding.
+        Requires nozomi_api_key to be configured.
+        """
+        try:
+            import base64
+            serialized_tx = bytes(transaction)
+            tx_b64 = base64.b64encode(serialized_tx).decode('utf-8')
+
+            url = f"https://fra2.secure.nozomi.temporal.xyz/?c={self.nozomi_api_key}"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [tx_b64, {"encoding": "base64"}]
+            }
+
+            response = requests.post(url, json=data, headers=headers, timeout=5)
+            if response.status_code == 200:
+                result = response.json()
+                if "result" in result:
+                    sig = result["result"]
+                    print(f"[NOZOMI] TX: {sig}")
+                    return sig
+                error_msg = result.get("error", {}).get("message", "Unknown")
+                print(f"[WARN] Nozomi error: {error_msg}")
+                return None
+            else:
+                print(f"[WARN] Nozomi HTTP {response.status_code}: {response.text[:200]}")
+                return None
+        except Exception as e:
+            print(f"[WARN] Nozomi failed: {str(e)}")
+            return None
+
+    def blast_transaction(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction to all configured endpoints simultaneously.
+
+        Uses ThreadPoolExecutor to blast the same signed TX to Helius RPC,
+        Jito, NextBlock, and Nozomi in parallel.  Returns the first
+        successful signature.  The network deduplicates identical TXs,
+        so only one lands.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Build list of (name, callable) for all enabled endpoints
+        sends = []
+
+        # RPC is included unless nextblock_only mode is active
+        if not getattr(self, 'nextblock_only', False):
+            sends.append(("RPC", lambda: self._send_via_regular_rpc(transaction)))
+
+        if self.use_jito:
+            sends.append(("Jito", lambda: self._send_via_jito(transaction)))
+        if self.nextblock_api_key:
+            sends.append(("NextBlock", lambda: self._send_via_nextblock(transaction)))
+        if self.nozomi_api_key:
+            sends.append(("Nozomi", lambda: self._send_via_nozomi(transaction)))
+
+        if not sends:
+            # Fallback — always have at least RPC
+            sends.append(("RPC", lambda: self._send_via_regular_rpc(transaction)))
+
+        if len(sends) == 1:
+            # Only one endpoint — no need for thread pool overhead
+            return sends[0][1]()
+
+        t_start = time.time()
+        first_sig = None
+
+        with ThreadPoolExecutor(max_workers=len(sends), thread_name_prefix="blast") as pool:
+            future_to_name = {pool.submit(fn): name for name, fn in sends}
+
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    sig = future.result()
+                    if sig and not first_sig:
+                        first_sig = sig
+                        elapsed = (time.time() - t_start) * 1000
+                        print(f"[BLAST] First response from {name} in {elapsed:.0f}ms: {sig[:12]}...")
+                except Exception as e:
+                    print(f"[BLAST] {name} error: {e}")
+
+        if not first_sig:
+            print("[BLAST] All endpoints failed")
+        return first_sig
 
     def get_all_token_positions(self) -> list:
         """Get all token positions from wallet
@@ -866,80 +1135,116 @@ class LiveTrader:
         try:
             mint_pubkey = Pubkey.from_string(mint_address)
 
-            # CRITICAL: Pump.fun ONLY supports legacy SPL Token for bonding curve buys
-            # Always use legacy SPL Token, even if the mint is Token-2022
+            # FAST PATH: use prebuild cache if available (populated at token detection)
+            prebuild = self._prebuild_cache.pop(mint_address, None)
 
-            # Derive bonding curve PDA
-            bonding_curve_pda, _ = Pubkey.find_program_address(
-                [b"bonding-curve", bytes(mint_pubkey)],
-                self.PUMPFUN_PROGRAM
-            )
+            if prebuild and prebuild.get('associated_bonding_curve'):
+                # Cache hit — skip all PDA derivation + RPC ATA probes (~300ms saved)
+                bonding_curve_pda = prebuild['bonding_curve_pda']
+                creator_vault = prebuild['creator_vault']
+                user_volume_accumulator = prebuild['user_volume_accumulator']
+                associated_bonding_curve = prebuild['associated_bonding_curve']
+                user_token_account = prebuild['user_token_account']
+                mint_token_program = prebuild['mint_token_program']
+                needs_ata_creation = prebuild['needs_ata_creation']
+                create_ata_ix = prebuild['create_ata_ix']
+                self._debug(f"Prebuild cache HIT for {mint_address[:8]}... — skipping RPC probes")
+            else:
+                # Cache miss — full derivation + RPC probes (original logic)
+                if prebuild:
+                    self._debug(f"Prebuild cache PARTIAL for {mint_address[:8]}... — BC ATA missing, falling back")
 
-            # Get creator address from bonding curve data and derive creator_vault PDA
-            # Based on pumpfun library: creator_vault IS a PDA derived from creator pubkey
-            creator_pubkey = curve_data['creator']
-            creator_vault, _ = Pubkey.find_program_address(
-                [b"creator-vault", bytes(creator_pubkey)],
-                self.PUMPFUN_PROGRAM
-            )
+                # Derive bonding curve PDA
+                bonding_curve_pda, _ = Pubkey.find_program_address(
+                    [b"bonding-curve", bytes(mint_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
 
-            # Derive user volume accumulator PDA (tracks individual user's volume)
-            user_volume_accumulator, _ = Pubkey.find_program_address(
-                [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
-                self.PUMPFUN_PROGRAM
-            )
+                # Get creator address from bonding curve data and derive creator_vault PDA
+                creator_pubkey = curve_data['creator']
+                creator_vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
 
-            # Try to find bonding curve ATA - Pump.fun may use either SPL Token or Token-2022
+                # Derive user volume accumulator PDA
+                user_volume_accumulator, _ = Pubkey.find_program_address(
+                    [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
+                    self.PUMPFUN_PROGRAM
+                )
 
-            # Try legacy SPL Token first
-            associated_bonding_curve_legacy = get_associated_token_address(
-                bonding_curve_pda,
-                mint_pubkey
-            )
+                # Probe BC ATAs to detect token program
+                associated_bonding_curve_legacy = get_associated_token_address(
+                    bonding_curve_pda, mint_pubkey
+                )
+                associated_bonding_curve_2022 = get_ata_with_program(
+                    bonding_curve_pda, mint_pubkey, TOKEN_2022_PROGRAM_ID
+                )
 
-            # Try Token-2022
-            associated_bonding_curve_2022 = get_ata_with_program(
-                bonding_curve_pda,
-                mint_pubkey,
-                TOKEN_2022_PROGRAM_ID
-            )
+                associated_bonding_curve = None
+                mint_token_program = TOKEN_PROGRAM_ID
 
-            # Check which one exists and detect the mint's token program
-            associated_bonding_curve = None
-            mint_token_program = TOKEN_PROGRAM_ID  # Default to legacy
-
-            try:
-                bc_ata_info = self.client.get_account_info(associated_bonding_curve_legacy)
-                if bc_ata_info.value:
-                    associated_bonding_curve = associated_bonding_curve_legacy
-                    mint_token_program = TOKEN_PROGRAM_ID
-            except:
-                pass
-
-            if not associated_bonding_curve:
                 try:
-                    bc_ata_info = self.client.get_account_info(associated_bonding_curve_2022)
+                    bc_ata_info = self.client.get_account_info(associated_bonding_curve_legacy)
                     if bc_ata_info.value:
-                        associated_bonding_curve = associated_bonding_curve_2022
-                        mint_token_program = TOKEN_2022_PROGRAM_ID
+                        associated_bonding_curve = associated_bonding_curve_legacy
+                        mint_token_program = TOKEN_PROGRAM_ID
                 except:
                     pass
 
-            if not associated_bonding_curve:
-                print(f"[ERROR] Token bonding curve not ready - skipping")
-                return None
+                if not associated_bonding_curve:
+                    try:
+                        bc_ata_info = self.client.get_account_info(associated_bonding_curve_2022)
+                        if bc_ata_info.value:
+                            associated_bonding_curve = associated_bonding_curve_2022
+                            mint_token_program = TOKEN_2022_PROGRAM_ID
+                    except:
+                        pass
 
-            # Get user's token account using the same token program as the mint
-            if mint_token_program == TOKEN_2022_PROGRAM_ID:
-                user_token_account = get_ata_with_program(
-                    self.keypair.pubkey(),
-                    mint_pubkey,
-                    TOKEN_2022_PROGRAM_ID
-                )
-            else:
-                user_token_account = get_associated_token_address(
-                    self.keypair.pubkey(),
-                    mint_pubkey
+                if not associated_bonding_curve:
+                    print(f"[ERROR] Token bonding curve not ready - skipping")
+                    return None
+
+                # Derive user token account
+                if mint_token_program == TOKEN_2022_PROGRAM_ID:
+                    user_token_account = get_ata_with_program(
+                        self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID
+                    )
+                else:
+                    user_token_account = get_associated_token_address(
+                        self.keypair.pubkey(), mint_pubkey
+                    )
+
+                # Check user ATA existence
+                needs_ata_creation = False
+                create_ata_ix = None
+                try:
+                    user_ata_info = self.client.get_account_info(user_token_account)
+                    if not user_ata_info.value:
+                        needs_ata_creation = True
+                except Exception:
+                    needs_ata_creation = True
+
+                if needs_ata_creation:
+                    create_ata_ix = Instruction(
+                        program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+                        accounts=[
+                            AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),
+                            AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
+                            AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),
+                        ],
+                        data=b"",
+                    )
+
+            # If creator_vault wasn't available from prebuild, derive it now
+            if not creator_vault:
+                creator_pubkey = curve_data['creator']
+                creator_vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator_pubkey)],
+                    self.PUMPFUN_PROGRAM
                 )
 
             # Build buy instruction data
@@ -982,55 +1287,23 @@ class LiveTrader:
                 accounts=accounts
             )
 
-            # Check if user's ATA exists and create it if needed
+            # Assemble instruction list
             instructions = [
-                set_compute_unit_limit(self.compute_limit),
+                set_compute_unit_limit(self.buy_compute_limit),
                 set_compute_unit_price(self.priority_fee),
             ]
 
-            try:
-                user_ata_info = self.client.get_account_info(user_token_account)
-                if not user_ata_info.value:
-                    # Build ATA creation instruction MANUALLY using the detected token program
-                    create_ata_ix = Instruction(
-                        program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-                        accounts=[
-                            AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),   # payer
-                            AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),      # ata
-                            AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=False), # owner
-                            AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),           # mint
-                            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),     # system
-                            AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),    # token program (detected)
-                        ],
-                        data=b"",  # ATA program uses empty data for create instruction
-                    )
-                    instructions.append(create_ata_ix)
-                    prog_name = "Token-2022" if mint_token_program == TOKEN_2022_PROGRAM_ID else "SPL Token"
-                else:
-                    pass  # ATA already exists
-            except Exception as e:
-                # If we can't check, try to create it (will fail gracefully if exists)
-                create_ata_ix = Instruction(
-                    program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
-                    accounts=[
-                        AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),
-                        AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
-                        AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=False),
-                        AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-                        AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),
-                    ],
-                    data=b"",
-                )
+            # Add ATA creation if needed (prebuild or fallback already determined this)
+            if needs_ata_creation and create_ata_ix:
                 instructions.append(create_ata_ix)
 
-            # Add the buy instruction last
+            # Add the buy instruction
             instructions.append(buy_instruction)
 
             # Add Jito tip if MEV protection is enabled
             if self.use_jito:
-                # Jito tip accounts (rotate for best results)
-                tip_accounts = [
+                import random
+                jito_tip_accounts = [
                     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
                     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
                     "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
@@ -1040,19 +1313,61 @@ class LiveTrader:
                     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
                     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
                 ]
-                import random
-                tip_account = Pubkey.from_string(random.choice(tip_accounts))
-
-                # Add tip instruction to the END
-                tip_instruction = transfer(
-                    TransferParams(
-                        from_pubkey=self.keypair.pubkey(),
-                        to_pubkey=tip_account,
-                        lamports=self.jito_tip_lamports
-                    )
-                )
-                instructions.append(tip_instruction)
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(jito_tip_accounts)),
+                    lamports=self.jito_tip_lamports
+                )))
                 print(f"[MEV] Added Jito tip: {self.jito_tip_lamports} lamports")
+
+            # Add NextBlock tip if configured
+            if self.nextblock_api_key:
+                import random
+                nextblock_tip_accounts = [
+                    "NEXTbLoCkB51HpLBLojQfpyVAMorm3zzKg7w9NFdqid",
+                    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",
+                    "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE",
+                    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",
+                    "NeXTBLoCKs9F1y5PJS9CKrFNNLU1keHW71rfh7KgA1X",
+                    "NexTBLockJYZ7QD7p2byrUa6df8ndV2WSd8GkbWqfbb",
+                    "neXtBLock1LeC67jYd1QdAa32kbVeubsfPNTJC1V5At",
+                    "nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nextblock_tip_accounts)),
+                    lamports=self.nextblock_tip_lamports
+                )))
+                print(f"[NEXTBLOCK] Added tip: {self.nextblock_tip_lamports} lamports")
+
+            # Add Nozomi tip if configured
+            if self.nozomi_api_key:
+                import random
+                nozomi_tip_accounts = [
+                    "TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq",
+                    "noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4",
+                    "noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE",
+                    "noz6uoYCDijhu1V7cutCpwxNiSovEwLdRHPwmgCGDNo",
+                    "noz9EPNcT7WH6Sou3sr3GGjHQYVkN3DNirpbvDkv9YJ",
+                    "nozc5yT15LazbLTFVZzoNZCwjh3yUtW86LoUyqsBu4L",
+                    "nozFrhfnNGoyqwVuwPAW4aaGqempx4PU6g6D9CJMv7Z",
+                    "nozievPk7HyK1Rqy1MPJwVQ7qQg2QoJGyP71oeDwbsu",
+                    "noznbgwYnBLDHu8wcQVCEw6kDrXkPdKkydGJGNXGvL7",
+                    "nozNVWs5N8mgzuD3qigrCG2UoKxZttxzZ85pvAQVrbP",
+                    "nozpEGbwx4BcGp6pvEdAh1JoC2CQGZdU6HbNP1v2p6P",
+                    "nozrhjhkCr3zXT3BiT4WCodYCUFeQvcdUkM7MqhKqge",
+                    "nozrwQtWhEdrA6W8dkbt9gnUaMs52PdAv5byipnadq3",
+                    "nozUacTVWub3cL4mJmGCYjKZTnE9RbdY5AP46iQgbPJ",
+                    "nozWCyTPppJjRuw2fpzDhhWbW355fzosWSzrrMYB1Qk",
+                    "nozWNju6dY353eMkMqURqwQEoM3SFgEKC6psLCSfUne",
+                    "nozxNBgWohjR75vdspfxR5H9ceC7XXH99xpxhVGt3Bb"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nozomi_tip_accounts)),
+                    lamports=self.nozomi_tip_lamports
+                )))
+                print(f"[NOZOMI] Added tip: {self.nozomi_tip_lamports} lamports")
 
             # Use pre-cached blockhash (background thread refreshes every 400ms)
             recent_blockhash = self._get_blockhash()
@@ -1064,18 +1379,23 @@ class LiveTrader:
                 recent_blockhash
             )
 
-            # Create transaction
-            transaction = Transaction.new_unsigned(message)
-
-            # Send transaction with MEV protection
-            print(f"  MEV Protection: {self.use_jito}")
+            # Sign and send
+            endpoints = []
+            if self.nextblock_api_key:
+                endpoints.append('NextBlock')
+            if self.nozomi_api_key:
+                endpoints.append('Nozomi')
+            if self.use_jito:
+                endpoints.append('Jito')
+            endpoints.append('RPC')
+            print(f"  Endpoints: {', '.join(endpoints)}")
             print(f"  Instructions: {len(instructions)}")
             print(f"[TX] Sending buy transaction...")
 
-            # Sign transaction
             transaction = Transaction([self.keypair], message, recent_blockhash)
 
-            signature = self.send_transaction_with_mev_protection(transaction)
+            # Blast to all configured endpoints simultaneously
+            signature = self.blast_transaction(transaction)
 
             if not signature:
                 return None
@@ -1231,11 +1551,58 @@ class LiveTrader:
             )
 
             instructions = [
-                set_compute_unit_limit(self.compute_limit),
+                set_compute_unit_limit(self.sell_compute_limit),
                 set_compute_unit_price(self.priority_fee),
                 sell_instruction,
                 close_ix,
             ]
+
+            # Add NextBlock tip if configured
+            if self.nextblock_api_key:
+                import random
+                nextblock_tip_accounts = [
+                    "NEXTbLoCkB51HpLBLojQfpyVAMorm3zzKg7w9NFdqid",
+                    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",
+                    "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE",
+                    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",
+                    "NeXTBLoCKs9F1y5PJS9CKrFNNLU1keHW71rfh7KgA1X",
+                    "NexTBLockJYZ7QD7p2byrUa6df8ndV2WSd8GkbWqfbb",
+                    "neXtBLock1LeC67jYd1QdAa32kbVeubsfPNTJC1V5At",
+                    "nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nextblock_tip_accounts)),
+                    lamports=self.nextblock_tip_lamports
+                )))
+
+            # Add Nozomi tip if configured
+            if self.nozomi_api_key:
+                import random
+                nozomi_tip_accounts = [
+                    "TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq",
+                    "noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4",
+                    "noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE",
+                    "noz6uoYCDijhu1V7cutCpwxNiSovEwLdRHPwmgCGDNo",
+                    "noz9EPNcT7WH6Sou3sr3GGjHQYVkN3DNirpbvDkv9YJ",
+                    "nozc5yT15LazbLTFVZzoNZCwjh3yUtW86LoUyqsBu4L",
+                    "nozFrhfnNGoyqwVuwPAW4aaGqempx4PU6g6D9CJMv7Z",
+                    "nozievPk7HyK1Rqy1MPJwVQ7qQg2QoJGyP71oeDwbsu",
+                    "noznbgwYnBLDHu8wcQVCEw6kDrXkPdKkydGJGNXGvL7",
+                    "nozNVWs5N8mgzuD3qigrCG2UoKxZttxzZ85pvAQVrbP",
+                    "nozpEGbwx4BcGp6pvEdAh1JoC2CQGZdU6HbNP1v2p6P",
+                    "nozrhjhkCr3zXT3BiT4WCodYCUFeQvcdUkM7MqhKqge",
+                    "nozrwQtWhEdrA6W8dkbt9gnUaMs52PdAv5byipnadq3",
+                    "nozUacTVWub3cL4mJmGCYjKZTnE9RbdY5AP46iQgbPJ",
+                    "nozWCyTPppJjRuw2fpzDhhWbW355fzosWSzrrMYB1Qk",
+                    "nozWNju6dY353eMkMqURqwQEoM3SFgEKC6psLCSfUne",
+                    "nozxNBgWohjR75vdspfxR5H9ceC7XXH99xpxhVGt3Bb"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nozomi_tip_accounts)),
+                    lamports=self.nozomi_tip_lamports
+                )))
 
             # Build and sign transaction (same pattern as buy)
             recent_blockhash = self._get_blockhash()  # pre-cached, no RPC wait
@@ -1248,7 +1615,7 @@ class LiveTrader:
             transaction = Transaction([self.keypair], message, recent_blockhash)
 
             print(f"[TX] Sending sell transaction...")
-            signature = self.send_transaction_with_mev_protection(transaction)
+            signature = self.blast_transaction(transaction)
 
             if not signature:
                 return None
