@@ -51,14 +51,10 @@ class LiveTrader:
         self.PUMPFUN_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
         self.PUMPFUN_GLOBAL = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
         self.PUMPFUN_EVENT_AUTHORITY = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
-        self.PUMPFUN_FEE_RECIPIENT = Pubkey.from_string("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM")
+        self.PUMPFUN_FEE_RECIPIENT = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
 
-        # Global volume accumulator - single global PDA shared across the whole program
-        # This account tracks total buy/sell volume for all tokens
-        self.GLOBAL_VOLUME_ACCUMULATOR, _ = Pubkey.find_program_address(
-            [b"global_volume_accumulator"],  # Exact seed from Pump.fun IDL
-            self.PUMPFUN_PROGRAM
-        )
+        # Global volume accumulator — hardcoded to match pumpfunlib/constants.py (verified on-chain)
+        self.GLOBAL_VOLUME_ACCUMULATOR = Pubkey.from_string("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y")
 
         # Fee-related accounts (new in current Pump.fun version)
         self.FEE_CONFIG = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
