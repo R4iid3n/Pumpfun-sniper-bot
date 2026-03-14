@@ -59,6 +59,12 @@ class LiveTrader:
         # Fee-related accounts (new in current Pump.fun version)
         self.FEE_CONFIG = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
         self.FEE_PROGRAM = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+        # Seed key for fee_config PDA derivation (changed in Feb 2026 pump.fun upgrade)
+        # Seeds: [b"fee_config", FEE_CONFIG_KEY] under FEE_PROGRAM
+        self.FEE_CONFIG_KEY = bytes([
+            1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170,
+            81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176,
+        ])
 
         # System programs
         self.SYSTEM_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
@@ -1088,13 +1094,19 @@ class LiveTrader:
                 self._debug("Creator vault not found at either offset, defaulting to offset 49")
                 creator = Pubkey(data[49:81])
 
+            # Cashback flag (byte 82, introduced in Feb 2026 pump.fun upgrade).
+            # WARNING: do NOT use Token-2022 as a proxy — many Token-2022 tokens
+            # have cashback_enabled = False.  Always read the authoritative flag here.
+            cashback_enabled = len(data) > 82 and data[82] != 0
+
             return {
                 'virtual_token_reserves': virtual_token_reserves,
                 'virtual_sol_reserves': virtual_sol_reserves,
                 'real_token_reserves': real_token_reserves,
                 'real_sol_reserves': real_sol_reserves,
                 'bonding_curve_pda': str(bonding_curve_pda),
-                'creator': creator
+                'creator': creator,
+                'cashback_enabled': cashback_enabled,
             }
 
         except Exception as e:
@@ -1244,23 +1256,31 @@ class LiveTrader:
                 )
 
             # Build buy instruction data
-            # Pump.fun format: [discriminator 8B] [amount: tokens_to_receive u64] [max_sol_cost u64]
-            # NOTE: amount=tokens (not SOL), maxSolCost=SOL+slippage (not tokens)
-            # min_tokens parameter holds the slippage fraction (e.g. 0.20 = 20%)
-            discriminator = bytes([102, 6, 61, 18, 1, 218, 235, 234])
+            # New pump.fun format after Feb 2026 upgrade: buy_exact_sol_in
+            # [discriminator 8B] [sol_amount u64 lamports] [min_tokens_out u64 raw]
+            # (old "buy" took tokens_to_receive + max_sol_cost; now reversed)
+            discriminator = bytes([56, 252, 116, 8, 158, 223, 205, 95])
+            sol_amount_lamports = int(sol_amount * 1e9)
             expected_tokens = self.calculate_buy_amount(curve_data, sol_amount)
-            expected_tokens_raw = int(expected_tokens * 1e6)          # tokens to receive
-            max_sol_cost_lamports = int(sol_amount * (1 + min_tokens) * 1e9)  # max SOL with slippage buffer
+            expected_tokens_raw = int(expected_tokens * 1e6)
+            # min_tokens is the slippage fraction; floor = expected * (1 - slippage)
+            min_tokens_out_raw = int(expected_tokens_raw * (1 - min_tokens))
 
-            instruction_data = discriminator + struct.pack('<QQ', expected_tokens_raw, max_sol_cost_lamports)
+            instruction_data = discriminator + struct.pack('<QQ', sol_amount_lamports, min_tokens_out_raw)
 
-            # Derive fee_config PDA the same way sell instruction and bumper.py do
+            # Derive fee_config PDA with updated seed key (Feb 2026 upgrade)
             fee_config_pda, _ = Pubkey.find_program_address(
-                [b"fee_config", bytes(self.PUMPFUN_PROGRAM)],
+                [b"fee_config", self.FEE_CONFIG_KEY],
                 self.FEE_PROGRAM
             )
 
-            # Build accounts for buy instruction - 16 accounts total (current Pump.fun program)
+            # Derive bonding_curve_v2 PDA — new required account (Feb 2026 upgrade)
+            bonding_curve_v2_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve-v2", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # Build accounts for buy instruction - 17 accounts total (after Feb 2026 upgrade)
             # Account order matters! This MUST match Solscan output exactly
             accounts = [
                 AccountMeta(pubkey=self.PUMPFUN_GLOBAL, is_signer=False, is_writable=False),           # 0 - Global
@@ -1275,10 +1295,11 @@ class LiveTrader:
                 AccountMeta(pubkey=creator_vault, is_signer=False, is_writable=True),                  # 9 - Creator Vault
                 AccountMeta(pubkey=self.PUMPFUN_EVENT_AUTHORITY, is_signer=False, is_writable=False),  # 10 - Event Authority
                 AccountMeta(pubkey=self.PUMPFUN_PROGRAM, is_signer=False, is_writable=False),          # 11 - Program
-                AccountMeta(pubkey=self.GLOBAL_VOLUME_ACCUMULATOR, is_signer=False, is_writable=True), # 12 - Global Volume Accumulator
+                AccountMeta(pubkey=self.GLOBAL_VOLUME_ACCUMULATOR, is_signer=False, is_writable=False), # 12 - Global Volume Accumulator (readonly after Feb 2026)
                 AccountMeta(pubkey=user_volume_accumulator, is_signer=False, is_writable=True),        # 13 - User Volume Accumulator
-                AccountMeta(pubkey=fee_config_pda, is_signer=False, is_writable=False),                # 14 - Fee Config (derived)
+                AccountMeta(pubkey=fee_config_pda, is_signer=False, is_writable=False),                # 14 - Fee Config
                 AccountMeta(pubkey=self.FEE_PROGRAM, is_signer=False, is_writable=False),              # 15 - Fee Program
+                AccountMeta(pubkey=bonding_curve_v2_pda, is_signer=False, is_writable=False),          # 16 - Bonding Curve V2 (Feb 2026)
             ]
 
             prog_name = "Token-2022" if mint_token_program == TOKEN_2022_PROGRAM_ID else "SPL Token"
@@ -1488,11 +1509,21 @@ class LiveTrader:
                 self.PUMPFUN_PROGRAM
             )
 
-            # Fee config PDA
+            # Fee config PDA (seed key changed in Feb 2026 pump.fun upgrade)
             pump_fee_config_pda, _ = Pubkey.find_program_address(
-                [b"fee_config", bytes(self.PUMPFUN_PROGRAM)],
+                [b"fee_config", self.FEE_CONFIG_KEY],
                 self.FEE_PROGRAM
             )
+
+            # Bonding curve v2 PDA — new required account (Feb 2026 upgrade)
+            bonding_curve_v2_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve-v2", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # Cashback flag from curve data (byte 82).
+            # Determines whether user_volume_accumulator must be included in sell.
+            cashback_enabled = curve_data.get('cashback_enabled', False)
 
             # Sell instruction data
             # BUG FIX: discriminator must be raw bytes, NOT packed as a u64 integer
@@ -1531,6 +1562,18 @@ class LiveTrader:
                 AccountMeta(pubkey=pump_fee_config_pda, is_signer=False, is_writable=False),
                 AccountMeta(pubkey=self.FEE_PROGRAM, is_signer=False, is_writable=False),
             ]
+
+            # Cashback-enabled tokens need user_volume_accumulator BEFORE bonding_curve_v2.
+            # Non-cashback tokens skip it entirely.
+            if cashback_enabled:
+                user_vol_sell, _ = Pubkey.find_program_address(
+                    [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
+                    self.PUMPFUN_PROGRAM
+                )
+                accounts.append(AccountMeta(pubkey=user_vol_sell, is_signer=False, is_writable=True))
+
+            # bonding_curve_v2 is always the last account (Feb 2026 upgrade)
+            accounts.append(AccountMeta(pubkey=bonding_curve_v2_pda, is_signer=False, is_writable=False))
 
             sell_instruction = Instruction(
                 program_id=self.PUMPFUN_PROGRAM,
