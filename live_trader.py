@@ -1258,6 +1258,12 @@ class LiveTrader:
 
             instruction_data = discriminator + struct.pack('<QQ', expected_tokens_raw, max_sol_cost_lamports)
 
+            # Derive fee_config PDA the same way sell instruction and bumper.py do
+            fee_config_pda, _ = Pubkey.find_program_address(
+                [b"fee_config", bytes(self.PUMPFUN_PROGRAM)],
+                self.FEE_PROGRAM
+            )
+
             # Build accounts for buy instruction - 16 accounts total (current Pump.fun program)
             # Account order matters! This MUST match Solscan output exactly
             accounts = [
@@ -1275,7 +1281,7 @@ class LiveTrader:
                 AccountMeta(pubkey=self.PUMPFUN_PROGRAM, is_signer=False, is_writable=False),          # 11 - Program
                 AccountMeta(pubkey=self.GLOBAL_VOLUME_ACCUMULATOR, is_signer=False, is_writable=True), # 12 - Global Volume Accumulator
                 AccountMeta(pubkey=user_volume_accumulator, is_signer=False, is_writable=True),        # 13 - User Volume Accumulator
-                AccountMeta(pubkey=self.FEE_CONFIG, is_signer=False, is_writable=False),               # 14 - Fee Config
+                AccountMeta(pubkey=fee_config_pda, is_signer=False, is_writable=False),                # 14 - Fee Config (derived)
                 AccountMeta(pubkey=self.FEE_PROGRAM, is_signer=False, is_writable=False),              # 15 - Fee Program
             ]
 
