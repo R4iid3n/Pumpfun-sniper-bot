@@ -1,28 +1,47 @@
-# ── Secrets / credentials ──────────────────────────────────────────────────
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
 Papertrade/wallet_config.json
 trading/config.json
+wallet_config.json
+rpc_urls.txt
+*.key
+*.pem
+.env
+.env.*
 
-# ── Python cache ────────────────────────────────────────────────────────────
+# ── Python ─────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
+*.egg-info/
+dist/
+build/
 
-# ── Virtual environments ─────────────────────────────────────────────────────
+# ── Virtual environments ───────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 
-# ── Logs ─────────────────────────────────────────────────────────────────────
+# ── Rust / Cargo ───────────────────────────────────────────────────────────────
+pumpfun-sniper-rust/target/
+
+# ── Cloned third-party repos ───────────────────────────────────────────────────
+yellowstone-grpc/
+github_fast_sniper_example/
+
+# ── Logs / tmp ─────────────────────────────────────────────────────────────────
 *.log
 logs/
+*.tmp
+sanity test command.txt
 
-# ── OS clutter ───────────────────────────────────────────────────────────────
+# ── IDE / OS ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ── IDE ──────────────────────────────────────────────────────────────────────
-.vscode/
-.idea/

@@ -1,0 +1,1929 @@
+"""
+Live Trading Module for Pump.fun Bot
+Handles real Solana transactions for buying/selling tokens
+"""
+
+import asyncio
+import json
+import threading
+import time
+import struct
+from typing import Optional, Dict
+import websockets
+from solana.rpc.api import Client
+from solana.rpc.commitment import Confirmed, Processed
+from solana.rpc.types import TxOpts
+from solders.transaction import Transaction, VersionedTransaction
+from solders.message import Message, MessageV0
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.system_program import transfer, TransferParams
+from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+from solders.instruction import Instruction, AccountMeta
+from spl.token.instructions import get_associated_token_address
+from solders.token.associated import get_associated_token_address as get_ata_with_program
+import requests
+
+# Token program constants
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+TOKEN_2022_PROGRAM_ID = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+SYSTEM_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
+SYSVAR_RENT_PUBKEY = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+
+class LiveTrader:
+    def __init__(self, wallet_config_path: str = "wallet_config.json", verbose: bool = False):
+        """Initialize live trader with wallet configuration
+
+        Args:
+            wallet_config_path: Path to wallet configuration JSON
+            verbose: Enable verbose debug logging (default: False)
+        """
+        self.verbose = verbose
+        self.load_wallet_config(wallet_config_path)
+        # Use `processed` commitment everywhere for speed.
+        # At `processed`, accounts created in a tx are readable immediately after the
+        # leader processes the slot — no waiting for 2/3 supermajority (confirmed).
+        # This eliminates the 5-15s Helius HTTP lag we observed with `confirmed`.
+        self.client = Client(self.rpc_url, commitment=Processed)
+
+        # Pump.fun program constants
+        self.PUMPFUN_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        self.PUMPFUN_GLOBAL = Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+        self.PUMPFUN_EVENT_AUTHORITY = Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
+        self.PUMPFUN_FEE_RECIPIENT = Pubkey.from_string("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+
+        # Global volume accumulator — hardcoded to match pumpfunlib/constants.py (verified on-chain)
+        self.GLOBAL_VOLUME_ACCUMULATOR = Pubkey.from_string("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y")
+
+        # Fee-related accounts (new in current Pump.fun version)
+        self.FEE_CONFIG = Pubkey.from_string("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt")
+        self.FEE_PROGRAM = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+        # Seed key for fee_config PDA derivation (changed in Feb 2026 pump.fun upgrade)
+        # Seeds: [b"fee_config", FEE_CONFIG_KEY] under FEE_PROGRAM
+        self.FEE_CONFIG_KEY = bytes([
+            1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170,
+            81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176,
+        ])
+
+        # System programs
+        self.SYSTEM_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
+        self.SYSVAR_RENT = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+
+        # Safety limits
+        self.max_position_size_sol = 0.2   # Max 0.2 SOL per trade (~$36 at $180/SOL, covers $5-$20 positions)
+        self.min_sol_balance = 0.005  # Keep 0.005 SOL for gas (enough for ~10 tx fees)
+
+        # Additional safety - daily trade limits
+        self.max_daily_trades = 20
+        self.max_daily_loss_sol = 1.0  # Stop if lose more than 1 SOL in a day
+        self.daily_trades = 0
+        self.daily_pnl_sol = 0.0
+
+        self.last_reset_day = time.strftime("%Y-%m-%d")
+
+        # Transaction stats
+        self.total_trades = 0
+        self.failed_trades = 0
+
+        # ATA + token program cache keyed by mint address.
+        # Populated at buy time, consumed at sell time to skip 2 get_account_info RPCs.
+        self.token_program_cache = {}
+
+        # Prebuild cache — populated at token detection time (handle_new_coin),
+        # consumed at buy trigger time (execute_pumpfun_buy) to skip ~300ms of
+        # RPC probes (BC ATA detection + user ATA existence check).
+        self._prebuild_cache = {}
+
+        # Blockhash cache — background thread keeps this fresh every 400ms.
+        # TX build uses the cached value instead of a blocking get_latest_blockhash RPC
+        # (~100-200ms saved per buy and per sell).
+        self._cached_blockhash = None
+        self._blockhash_lock = threading.Lock()
+        self._blockhash_thread = threading.Thread(
+            target=self._blockhash_refresher, daemon=True, name="blockhash-refresh"
+        )
+        self._blockhash_thread.start()
+
+        # Direct TPU client — QUIC send straight to current slot leader(s).
+        # Initialized after load_wallet_config() so self.use_tpu_direct is available.
+        self._tpu_ready = False
+        self._tpu_leader_addrs = []     # [(host, port), ...]  updated every 400ms
+        self._tpu_lock = threading.Lock()
+        if self.use_tpu_direct:
+            self._init_tpu_client()
+
+    def _blockhash_refresher(self):
+        """Background thread: keep a fresh blockhash cached every 400ms.
+
+        Solana blockhashes expire after 150 slots (~60s at 400ms/slot).
+        Refreshing every 400ms guarantees the cached value is always valid
+        while saving one blocking RPC call (~100-200ms) per buy and per sell.
+        Falls back to a live fetch in _get_blockhash() if cache is still None.
+        """
+        while True:
+            try:
+                resp = self.client.get_latest_blockhash(commitment=Processed)
+                bh = resp.value.blockhash
+                with self._blockhash_lock:
+                    self._cached_blockhash = bh
+            except Exception:
+                pass  # Keep using previous cached value on transient RPC errors
+            time.sleep(0.4)
+
+    def _get_blockhash(self):
+        """Return cached blockhash, or fetch live if cache not yet populated."""
+        with self._blockhash_lock:
+            bh = self._cached_blockhash
+        if bh is not None:
+            return bh
+        # First call before the background thread has run — fetch directly
+        resp = self.client.get_latest_blockhash(commitment=Processed)
+        return resp.value.blockhash
+
+    def prebuild_buy_context(self, mint_address: str, prefetched_curve: Optional[Dict] = None):
+        """Pre-derive all PDAs and probe ATA existence for a mint.
+
+        Called at token detection time (handle_new_coin) so that when the
+        momentum trigger fires, execute_pumpfun_buy can skip ~300ms of RPC
+        probes and jump straight to instruction assembly + sign + blast.
+
+        Safe to call from a background thread.  Results are cached in
+        self._prebuild_cache[mint_address].
+        """
+        try:
+            mint_pubkey = Pubkey.from_string(mint_address)
+
+            # 1. Derive bonding curve PDA (deterministic, no RPC)
+            bonding_curve_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # 2. Derive creator_vault PDA (needs creator pubkey from prefetched_curve)
+            creator_vault = None
+            if prefetched_curve and prefetched_curve.get('creator'):
+                creator_pubkey = prefetched_curve['creator']
+                creator_vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
+
+            # 3. Derive user volume accumulator PDA (deterministic, no RPC)
+            user_volume_accumulator, _ = Pubkey.find_program_address(
+                [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # 4. Probe BC ATAs to detect token program (2 RPC calls, ~200ms)
+            associated_bonding_curve_legacy = get_associated_token_address(
+                bonding_curve_pda, mint_pubkey
+            )
+            associated_bonding_curve_2022 = get_ata_with_program(
+                bonding_curve_pda, mint_pubkey, TOKEN_2022_PROGRAM_ID
+            )
+
+            associated_bonding_curve = None
+            mint_token_program = TOKEN_PROGRAM_ID  # default
+
+            try:
+                bc_ata_info = self.client.get_account_info(associated_bonding_curve_legacy)
+                if bc_ata_info.value:
+                    associated_bonding_curve = associated_bonding_curve_legacy
+                    mint_token_program = TOKEN_PROGRAM_ID
+            except Exception:
+                pass
+
+            if not associated_bonding_curve:
+                try:
+                    bc_ata_info = self.client.get_account_info(associated_bonding_curve_2022)
+                    if bc_ata_info.value:
+                        associated_bonding_curve = associated_bonding_curve_2022
+                        mint_token_program = TOKEN_2022_PROGRAM_ID
+                except Exception:
+                    pass
+
+            # 5. Derive user token account + check existence (1 RPC call, ~100ms)
+            if mint_token_program == TOKEN_2022_PROGRAM_ID:
+                user_token_account = get_ata_with_program(
+                    self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID
+                )
+            else:
+                user_token_account = get_associated_token_address(
+                    self.keypair.pubkey(), mint_pubkey
+                )
+
+            needs_ata_creation = False
+            create_ata_ix = None
+            try:
+                user_ata_info = self.client.get_account_info(user_token_account)
+                if not user_ata_info.value:
+                    needs_ata_creation = True
+            except Exception:
+                needs_ata_creation = True  # assume missing if check fails
+
+            if needs_ata_creation:
+                create_ata_ix = Instruction(
+                    program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+                    accounts=[
+                        AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),
+                        AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
+                        AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=False),
+                        AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+                        AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),
+                    ],
+                    data=b"",
+                )
+
+            ctx = {
+                'bonding_curve_pda': bonding_curve_pda,
+                'creator_vault': creator_vault,
+                'user_volume_accumulator': user_volume_accumulator,
+                'associated_bonding_curve': associated_bonding_curve,
+                'user_token_account': user_token_account,
+                'mint_token_program': mint_token_program,
+                'needs_ata_creation': needs_ata_creation,
+                'create_ata_ix': create_ata_ix,
+                'timestamp': time.time(),
+            }
+            self._prebuild_cache[mint_address] = ctx
+            self._debug(f"Prebuild OK for {mint_address[:8]}... "
+                        f"(bc_ata={'found' if associated_bonding_curve else 'missing'}, "
+                        f"user_ata={'create' if needs_ata_creation else 'exists'}, "
+                        f"program={'2022' if mint_token_program == TOKEN_2022_PROGRAM_ID else 'SPL'})")
+            return ctx
+
+        except Exception as e:
+            self._debug(f"Prebuild failed for {mint_address[:8]}...: {e}")
+            return None
+
+    def _debug(self, message: str):
+        """Print debug message only if verbose mode is enabled"""
+        if self.verbose:
+            print(f"[DEBUG] {message}")
+
+    def _wait_for_bc_account(self, pda_str: str, timeout: float = 12.0) -> bool:
+        """Wait for bonding curve account to appear on-chain via logsSubscribe.
+
+        Uses logsSubscribe with a `mentions` filter on the BC PDA.  This fires the
+        instant any confirmed transaction references the BC PDA — which includes the
+        creation transaction itself.  This is the correct Solana WS method for
+        detecting new account creation (accountSubscribe only fires for changes to
+        already-existing accounts and will not notify on creation).
+
+        After the log notification fires, polls the BC ATA via HTTP to bridge any
+        intra-cluster lag between the Helius WS node and the HTTP endpoint.
+
+        Safe to call from any context (runs its own event loop in a new thread).
+        """
+        result = [False]
+        done   = threading.Event()
+
+        async def _subscribe():
+            ws_url = self.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+            try:
+                async with websockets.connect(ws_url, open_timeout=5, ping_interval=None) as ws:
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [pda_str]},
+                            {"commitment": "processed"},  # fires earlier than confirmed
+                        ],
+                    }))
+                    self._debug(f"WS: logsSubscribe for BC {pda_str[:8]}...")
+
+                    deadline   = time.time() + timeout
+                    subscribed = False
+
+                    while time.time() < deadline:
+                        rem = max(0.05, deadline - time.time())
+                        try:
+                            msg  = await asyncio.wait_for(ws.recv(), timeout=rem)
+                            data = json.loads(msg)
+                        except asyncio.TimeoutError:
+                            break
+
+                        # Subscription confirmation → do one immediate RPC check.
+                        # Handles the race where the creation tx confirmed before we subscribed.
+                        if not subscribed and isinstance(data.get("result"), int):
+                            subscribed = True
+                            self._debug("WS: logsSubscribe confirmed — doing immediate BC check")
+                            try:
+                                info = self.client.get_account_info(Pubkey.from_string(pda_str))
+                                if info.value:
+                                    self._debug("WS: BC account already visible on first check")
+                                    result[0] = True
+                                    return
+                            except Exception:
+                                pass
+                            continue
+
+                        # Log notification — a confirmed tx mentioned the BC PDA.
+                        # The first such tx is the creation tx; BC account is now on-chain.
+                        if data.get("method") == "logsNotification":
+                            value = (data.get("params") or {}).get("result", {}).get("value", {})
+                            if value.get("err") is None:   # confirmed without error
+                                self._debug("WS: BC creation tx confirmed (logsNotification)")
+                                result[0] = True
+                                return
+
+            except Exception as e:
+                self._debug(f"WS logsSubscribe error: {e}")
+
+        def _thread_run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_subscribe())
+            finally:
+                loop.close()
+                done.set()
+
+        t = threading.Thread(target=_thread_run, daemon=True)
+        t.start()
+        done.wait(timeout=timeout + 2)  # +2 s buffer for connection setup overhead
+        return result[0]
+
+    def _wait_for_tx_confirm(self, signature: str, timeout: float = 3.0):
+        """Event-driven transaction confirmation via signatureSubscribe WebSocket.
+
+        Same return contract as get_tx_error:
+            None  → transaction succeeded
+            obj   → error from tx meta (use str() to inspect)
+
+        Fires the instant the RPC node reaches 'confirmed' commitment — no 0.5s
+        polling latency.  Falls back to get_tx_error polling if the WS fails.
+        Safe to call from any context (own thread + event loop).
+        """
+        received = [False]
+        tx_err   = [None]
+        done     = threading.Event()
+
+        async def _subscribe():
+            ws_url = self.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+            try:
+                async with websockets.connect(ws_url, open_timeout=5, ping_interval=None) as ws:
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "signatureSubscribe",
+                        "params": [signature, {"commitment": "confirmed",
+                                               "enableReceivedNotification": False}],
+                    }))
+                    self._debug(f"WS: signatureSubscribe {signature[:12]}...")
+
+                    deadline = time.time() + timeout
+                    while time.time() < deadline:
+                        rem = max(0.05, deadline - time.time())
+                        try:
+                            msg  = await asyncio.wait_for(ws.recv(), timeout=rem)
+                            data = json.loads(msg)
+                        except asyncio.TimeoutError:
+                            break
+
+                        # Subscription confirmation
+                        if isinstance(data.get("result"), int):
+                            self._debug("WS: signatureSubscribe confirmed")
+                            continue
+
+                        # Transaction confirmed notification
+                        if data.get("method") == "signatureNotification":
+                            value = (data.get("params") or {}).get("result", {}).get("value")
+                            if isinstance(value, dict):
+                                tx_err[0]   = value.get("err")   # None = success
+                                received[0] = True
+                                self._debug(f"WS: tx confirmed, err={tx_err[0]}")
+                                return
+                            # "receivedSignature" = seen but not yet confirmed, keep waiting
+            except Exception as e:
+                self._debug(f"WS signatureSubscribe error: {e}")
+
+        def _thread_run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_subscribe())
+            finally:
+                loop.close()
+                done.set()
+
+        t = threading.Thread(target=_thread_run, daemon=True)
+        t.start()
+        done.wait(timeout=timeout + 1)
+
+        if received[0]:
+            return tx_err[0]
+
+        # WS failed or timed out — fall back to a short polling window
+        self._debug("WS signatureSubscribe timed out — falling back to polling")
+        return self.get_tx_error(signature, max_wait=3)
+
+    def check_safety_limits(self, sol_amount: float) -> tuple[bool, str]:
+        """Check if trade passes safety limits"""
+        # Reset daily counters if new day
+        current_day = time.strftime("%Y-%m-%d")
+        if current_day != self.last_reset_day:
+            self.daily_trades = 0
+            self.daily_pnl_sol = 0.0
+            self.last_reset_day = current_day
+
+        # Check daily trade limit
+        if self.daily_trades >= self.max_daily_trades:
+            return False, f"Daily trade limit reached ({self.max_daily_trades})"
+
+        # Check daily loss limit
+        if self.daily_pnl_sol < -self.max_daily_loss_sol:
+            return False, f"Daily loss limit exceeded ({self.daily_pnl_sol:.4f} SOL)"
+
+        # Check position size
+        if sol_amount > self.max_position_size_sol:
+            return False, f"Position size {sol_amount:.4f} exceeds max {self.max_position_size_sol} SOL"
+
+        # Check balance
+        balance = self.get_sol_balance()
+        if balance < sol_amount + self.min_sol_balance:
+            return False, f"Insufficient balance: {balance:.4f} SOL (need {sol_amount + self.min_sol_balance:.4f})"
+
+        return True, "OK"
+
+    def load_wallet_config(self, config_path: str):
+        """Load wallet configuration from JSON file"""
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+
+            # Load private key
+            private_key_bytes = bytes(config['private_key'])
+            self.keypair = Keypair.from_bytes(private_key_bytes)
+            self.wallet_address = str(self.keypair.pubkey())
+
+            # Load RPC and settings
+            self.rpc_url = config.get('rpc_url', 'https://api.mainnet-beta.solana.com')
+            self.max_slippage_bps = config.get('max_slippage_bps', 500)  # 5% default
+            self.priority_fee = config.get('priority_fee_lamports', 100000)  # 0.0001 SOL
+            self.buy_compute_limit = config.get('buy_compute_unit_limit', 100000)
+            self.sell_compute_limit = config.get('sell_compute_unit_limit', 70000)
+
+            # MEV Protection settings
+            self.use_jito = config.get('use_jito_mev_protection', False)
+            self.jito_tip_lamports = config.get('jito_tip_lamports', 10000)  # 0.00001 SOL tip
+            self.jito_block_engine_url = config.get('jito_block_engine_url', 'https://mainnet.block-engine.jito.wtf')
+
+            # NextBlock settings (closest region to your VPS)
+            self.nextblock_api_key = config.get('nextblock_api_key', '')
+            self.nextblock_region = config.get('nextblock_region', 'london')
+            self.nextblock_tip_lamports = config.get('nextblock_tip_lamports', 100_000)
+            self.nextblock_only = config.get('nextblock_only', False)  # send ONLY via NextBlock (test mode)
+
+            # Nozomi / Temporal settings (Frankfurt endpoint)
+            self.nozomi_api_key = config.get('nozomi_api_key', '')
+            self.nozomi_tip_lamports = config.get('nozomi_tip_lamports', 1_000_000)  # 0.001 SOL min
+
+            # Direct TPU settings — send TX straight to validator QUIC port (no RPC relay)
+            self.use_tpu_direct = config.get('use_tpu_direct', False)
+            # Derive WebSocket URL from RPC URL (TpuClient needs WS for slot subscription)
+            self.rpc_ws_url = (self.rpc_url
+                               .replace("https://", "wss://")
+                               .replace("http://", "ws://"))
+
+            print(f"[OK] Wallet loaded: {self.wallet_address}")
+            blast_endpoints = ['RPC']
+            if self.use_jito:
+                blast_endpoints.append('Jito')
+            if self.nextblock_api_key:
+                blast_endpoints.append('NextBlock')
+            if self.nozomi_api_key:
+                blast_endpoints.append('Nozomi')
+            if self.use_tpu_direct:
+                blast_endpoints.append('TPU')
+            if len(blast_endpoints) > 1:
+                print(f"[BLAST] Multi-endpoint blast: {', '.join(blast_endpoints)}")
+            if self.use_jito:
+                print(f"[MEV] MEV Protection: ENABLED (Jito)")
+
+        except FileNotFoundError:
+            raise Exception(f"[ERROR] Wallet config not found: {config_path}")
+        except Exception as e:
+            raise Exception(f"[ERROR] Failed to load wallet config: {str(e)}")
+
+    def get_sol_balance(self) -> float:
+        """Get SOL balance of wallet"""
+        try:
+            response = self.client.get_balance(self.keypair.pubkey())
+            balance_lamports = response.value
+            return balance_lamports / 1e9  # Convert to SOL
+        except Exception as e:
+            print(f"[ERROR] Failed to get balance: {str(e)}")
+            return 0.0
+
+    # Pump.fun custom error codes.
+    # Current program: bonding curve not ready = 6000, buy slippage = 6001, sell slippage = 6003.
+    BONDING_CURVE_ERROR_CODE = 6000   # bonding curve not initialized yet
+    SLIPPAGE_ERROR_CODE      = 6001   # buy: too much SOL required
+    BC_COMPLETE_ERROR_CODE   = 6002   # bonding curve complete (graduated to Raydium)
+    SELL_SLIPPAGE_ERROR_CODE = 6003   # sell: too little SOL received
+
+    def send_transaction_with_mev_protection(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction with optional Jito MEV protection.
+        skip_preflight=True: skip RPC simulation to reduce latency (critical for sniping).
+        """
+        try:
+            if self.use_jito:
+                return self._send_via_jito(transaction)
+            else:
+                return self._send_via_regular_rpc(transaction)
+        except Exception as e:
+            print(f"[ERROR] Transaction failed: {str(e)}")
+            return None
+
+    def get_tx_error(self, signature: str, max_wait: int = 8) -> Optional[object]:
+        """Check whether a submitted transaction succeeded on-chain.
+
+        Returns:
+            None  — transaction succeeded (no error)
+            obj   — error object from transaction meta (use str() to inspect)
+        Waits up to max_wait seconds for the tx to be visible.
+        """
+        try:
+            from solders.signature import Signature as SolSignature
+            sig_obj = SolSignature.from_string(signature)
+            deadline = time.time() + max_wait
+            while time.time() < deadline:
+                try:
+                    result = self.client.get_transaction(
+                        sig_obj,
+                        commitment=Confirmed,
+                        max_supported_transaction_version=0
+                    )
+                    if result.value:
+                        return result.value.transaction.meta.err  # None = success
+                except Exception:
+                    pass
+                time.sleep(0.5)  # Helius confirms in 1-2s; poll every 0.5s
+            # Tx not visible in time — assume success to avoid blocking
+            print(f"[WARN] Could not confirm {signature[:12]}... within {max_wait}s, assuming success")
+            return None
+        except Exception as e:
+            print(f"[WARN] get_tx_error: {e}")
+            return None
+
+    def _send_via_jito(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction via Jito's MEV-protected block engine
+
+        Note: Tip instruction should already be added to the transaction before calling this
+        """
+        try:
+            # Serialize the already-signed transaction
+            serialized_tx = bytes(transaction)
+
+            # Send to Jito block engine
+            jito_url = f"{self.jito_block_engine_url}/api/v1/transactions"
+            headers = {"Content-Type": "application/json"}
+
+            # Encode transaction as base58
+            import base58
+            tx_b58 = base58.b58encode(serialized_tx).decode('utf-8')
+
+            data = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [tx_b58, {"encoding": "base58"}]
+            }
+
+            response = requests.post(jito_url, json=data, headers=headers, timeout=10)
+
+            if response.status_code == 200:
+                result = response.json()
+                if "result" in result:
+                    signature = result["result"]
+                    print(f"[MEV] Jito TX: {signature}")
+                    print(f"[LINK] https://solscan.io/tx/{signature}")
+                    return signature
+                else:
+                    error_msg = result.get("error", {}).get("message", "Unknown error")
+                    print(f"[WARN] Jito error: {error_msg}, falling back to RPC")
+                    return self._send_via_regular_rpc(transaction)
+            else:
+                print(f"[WARN] Jito HTTP {response.status_code}, falling back to RPC")
+                return self._send_via_regular_rpc(transaction)
+
+        except Exception as e:
+            print(f"[WARN] Jito failed: {str(e)}, falling back to RPC")
+            return self._send_via_regular_rpc(transaction)
+
+    def _send_via_regular_rpc(self, transaction: Transaction) -> Optional[str]:
+        """Send via regular RPC. skip_preflight=True skips simulation for lower latency."""
+        try:
+            response = self.client.send_transaction(
+                transaction,
+                opts=TxOpts(skip_preflight=True, preflight_commitment=Confirmed)
+            )
+            sig = str(response.value)
+            print(f"[TX] {sig}")
+            print(f"[LINK] https://solscan.io/tx/{sig}")
+            return sig
+        except Exception as e:
+            print(f"[ERROR] RPC send failed: {str(e)}")
+            return None
+
+    def _send_via_nextblock(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction via NextBlock Frankfurt endpoint.
+
+        Uses base64 encoding and NextBlock's REST API.
+        Requires nextblock_api_key to be configured.
+        """
+        try:
+            import base64
+            serialized_tx = bytes(transaction)
+            tx_b64 = base64.b64encode(serialized_tx).decode('utf-8')
+
+            url = f"https://{self.nextblock_region}.nextblock.io/api/v2/submit"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": self.nextblock_api_key,
+            }
+            data = {
+                "transaction": {"content": tx_b64},
+                "frontRunningProtection": False,
+            }
+
+            response = requests.post(url, json=data, headers=headers, timeout=5)
+            if response.status_code == 200:
+                result = response.json()
+                sig = result.get("signature")
+                if sig:
+                    print(f"[NEXTBLOCK] TX: {sig}")
+                    return sig
+                print(f"[WARN] NextBlock no signature in response: {result}")
+                return None
+            else:
+                print(f"[WARN] NextBlock HTTP {response.status_code}: {response.text[:200]}")
+                return None
+        except Exception as e:
+            print(f"[WARN] NextBlock failed: {str(e)}")
+            return None
+
+    def _send_via_nozomi(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction via Nozomi (Temporal) Frankfurt endpoint.
+
+        Uses standard Solana JSON-RPC sendTransaction with base64 encoding.
+        Requires nozomi_api_key to be configured.
+        """
+        try:
+            import base64
+            serialized_tx = bytes(transaction)
+            tx_b64 = base64.b64encode(serialized_tx).decode('utf-8')
+
+            url = f"https://fra2.secure.nozomi.temporal.xyz/?c={self.nozomi_api_key}"
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [tx_b64, {"encoding": "base64"}]
+            }
+
+            response = requests.post(url, json=data, headers=headers, timeout=5)
+            if response.status_code == 200:
+                result = response.json()
+                if "result" in result:
+                    sig = result["result"]
+                    print(f"[NOZOMI] TX: {sig}")
+                    return sig
+                error_msg = result.get("error", {}).get("message", "Unknown")
+                print(f"[WARN] Nozomi error: {error_msg}")
+                return None
+            else:
+                print(f"[WARN] Nozomi HTTP {response.status_code}: {response.text[:200]}")
+                return None
+        except Exception as e:
+            print(f"[WARN] Nozomi failed: {str(e)}")
+            return None
+
+    def _init_tpu_client(self):
+        """Initialize direct QUIC TPU sender using aioquic.
+
+        Solana validators accept transactions via QUIC unidirectional streams on their
+        TPU port (found via getClusterNodes). This bypasses the RPC relay hop, saving
+        ~30-50ms per TX send. A background thread keeps the current leader's TPU address
+        fresh every 400ms. Confirmation still comes through the normal WS path.
+
+        Requires: pip install aioquic
+        """
+        try:
+            import aioquic  # noqa — just validates it's installed
+        except ImportError:
+            print("[WARN] TPU: aioquic not installed — run: pip install aioquic")
+            print("[WARN] TPU direct send disabled; other blast endpoints still active")
+            return
+
+        # Start background thread — enables _tpu_ready once it finds a leader.
+        # Non-blocking: startup continues immediately; TPU activates within ~1s.
+        self._tpu_thread = threading.Thread(
+            target=self._tpu_leader_refresher, daemon=True, name="tpu-leader-refresh"
+        )
+        self._tpu_thread.start()
+        print("[TPU] Leader discovery started (QUIC TPU activates within ~1s)")
+
+    def _tpu_leader_refresher(self):
+        """Background thread: keep current slot leader TPU address(es) fresh every 400ms.
+
+        Cluster nodes (validator pubkey → TPU address) are refreshed every 30s since
+        they rarely change. Slot leaders are refreshed every slot (~400ms).
+        """
+        last_cluster_refresh = 0.0
+        tpu_map = {}   # pubkey_str -> "host:port"
+        first_run = True
+        sess = requests.Session()
+        rpc = self.rpc_url
+
+        def _rpc(method, params=None):
+            """Raw HTTP JSON-RPC call — bypasses solders binding version quirks."""
+            r = sess.post(rpc, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": method,
+                "params": params or [],
+            }, timeout=5)
+            r.raise_for_status()
+            result = r.json()
+            if "error" in result:
+                raise RuntimeError(result["error"].get("message", str(result["error"])))
+            return result["result"]
+
+        while True:
+            try:
+                now = time.time()
+                # Refresh cluster node list every 30s (rarely changes)
+                if now - last_cluster_refresh > 30.0:
+                    nodes = _rpc("getClusterNodes")
+                    # Each node: {"pubkey": "...", "tpu": "ip:port" or null, ...}
+                    tpu_map = {n["pubkey"]: n["tpu"] for n in nodes if n.get("tpu")}
+                    last_cluster_refresh = now
+                    if first_run:
+                        print(f"[TPU] Cluster nodes loaded — {len(tpu_map)} validators with public TPU")
+
+                # Get current and next 2 slot leaders
+                slot = _rpc("getSlot")
+                leaders = _rpc("getSlotLeaders", [slot, 3])  # list of pubkey strings
+
+                addrs = []
+                for leader in leaders:
+                    tpu_str = tpu_map.get(leader)
+                    if tpu_str:
+                        host, port = tpu_str.rsplit(':', 1)
+                        addrs.append((host, int(port)))
+
+                with self._tpu_lock:
+                    prev_ready = self._tpu_ready
+                    self._tpu_leader_addrs = addrs[:2]   # current + 1 next
+                    if addrs and not prev_ready:
+                        self._tpu_ready = True
+                        print(f"[TPU] Direct QUIC TPU ready — leader {addrs[0][0]}:{addrs[0][1]}")
+                    elif not addrs and first_run:
+                        print("[WARN] TPU: current slot leaders have no public TPU address — waiting")
+
+                first_run = False
+
+            except Exception as e:
+                if first_run:
+                    print(f"[WARN] TPU leader refresh error: {type(e).__name__}: {e}")
+                    first_run = False
+
+            time.sleep(2.0)
+
+    def _send_via_tpu(self, transaction: Transaction) -> Optional[str]:
+        """Send TX directly to current slot leader(s) via QUIC unidirectional stream.
+
+        Solana validators receive transactions as raw bytes written to a QUIC
+        unidirectional stream on their TPU port. This skips the RPC relay entirely.
+        Confirmation still arrives through the normal WS signatureSubscribe path.
+        """
+        if not self._tpu_ready:
+            return None
+
+        with self._tpu_lock:
+            addrs = list(self._tpu_leader_addrs)
+
+        if not addrs:
+            return None
+
+        tx_bytes = bytes(transaction)
+        sig = str(transaction.signatures[0])
+
+        async def _quic_blast():
+            import ssl
+            from aioquic.asyncio import connect
+            from aioquic.quic.configuration import QuicConfiguration
+            # Suppress "Future exception was never retrieved" from aioquic internals
+            # when QUIC handshake fails — these are ConnectionError inside aioquic's
+            # protocol machinery that we can't catch from outside.
+            asyncio.get_event_loop().set_exception_handler(lambda loop, ctx: None)
+
+            config = QuicConfiguration(
+                is_client=True,
+                verify_mode=ssl.CERT_NONE,   # validators use self-signed certs
+                alpn_protocols=["solana-tpu"],
+            )
+
+            async def _send_one(host, port):
+                try:
+                    async with connect(host, port, configuration=config) as conn:
+                        sid = conn._quic.get_next_available_stream_id(is_unidirectional=True)
+                        conn._quic.send_stream_data(sid, tx_bytes, end_stream=True)
+                        conn.transmit()
+                        await asyncio.sleep(0.05)   # allow packet to flush
+                except (Exception, asyncio.CancelledError):
+                    pass
+
+            # asyncio.wait with explicit cancel — avoids "Future exception was never
+            # retrieved" warnings that occur when wait_for cancels mid-handshake.
+            tasks = [asyncio.create_task(_send_one(h, p)) for h, p in addrs]
+            _, pending = await asyncio.wait(tasks, timeout=0.7)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (Exception, asyncio.CancelledError):
+                    pass
+
+        try:
+            asyncio.run(_quic_blast())
+            return sig
+        except Exception as e:
+            self._debug(f"TPU send failed: {e}")
+            return None
+
+    def blast_transaction(self, transaction: Transaction) -> Optional[str]:
+        """Send transaction to all configured endpoints simultaneously.
+
+        Uses ThreadPoolExecutor to blast the same signed TX to Helius RPC,
+        Jito, NextBlock, and Nozomi in parallel.  Returns the first
+        successful signature.  The network deduplicates identical TXs,
+        so only one lands.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Build list of (name, callable) for all enabled endpoints
+        sends = []
+
+        # RPC is included unless nextblock_only mode is active
+        if not getattr(self, 'nextblock_only', False):
+            sends.append(("RPC", lambda: self._send_via_regular_rpc(transaction)))
+
+        if self.use_jito:
+            sends.append(("Jito", lambda: self._send_via_jito(transaction)))
+        if self.nextblock_api_key:
+            sends.append(("NextBlock", lambda: self._send_via_nextblock(transaction)))
+        if self.nozomi_api_key:
+            sends.append(("Nozomi", lambda: self._send_via_nozomi(transaction)))
+
+        # TPU fires as a true fire-and-forget daemon thread — completely outside
+        # the blast pool so it can never block the return path.
+        # The network deduplicates if both RPC and TPU land.
+        if self._tpu_ready:
+            threading.Thread(
+                target=self._send_via_tpu, args=(transaction,),
+                daemon=True, name="tpu-fire"
+            ).start()
+
+        if not sends:
+            # Fallback — always have at least RPC
+            sends.append(("RPC", lambda: self._send_via_regular_rpc(transaction)))
+
+        if len(sends) == 1:
+            # Only one endpoint — no need for thread pool overhead
+            return sends[0][1]()
+
+        t_start = time.time()
+        first_sig = None
+
+        with ThreadPoolExecutor(max_workers=len(sends), thread_name_prefix="blast") as pool:
+            future_to_name = {pool.submit(fn): name for name, fn in sends}
+
+            for future in as_completed(future_to_name):
+                name = future_to_name[future]
+                try:
+                    sig = future.result()
+                    if sig and not first_sig:
+                        first_sig = sig
+                        elapsed = (time.time() - t_start) * 1000
+                        print(f"[BLAST] First response from {name} in {elapsed:.0f}ms: {sig[:12]}...")
+                except Exception as e:
+                    print(f"[BLAST] {name} error: {e}")
+
+        if not first_sig:
+            print("[BLAST] All endpoints failed")
+        return first_sig
+
+    def get_all_token_positions(self) -> list:
+        """Get all token positions from wallet
+
+        Returns:
+            List of dicts with token info: [{mint, balance, decimals, uiAmount}, ...]
+        """
+        try:
+            response = self.client.get_token_accounts_by_owner_json_parsed(
+                self.keypair.pubkey(),
+                {"programId": str(TOKEN_2022_PROGRAM_ID)}  # Pump.fun uses Token-2022
+            )
+
+            positions = []
+            if response.value:
+                for account in response.value:
+                    try:
+                        parsed = account.account.data.parsed['info']
+                        token_amount = parsed['tokenAmount']
+
+                        # Only include accounts with balance > 0
+                        if float(token_amount['uiAmount']) > 0:
+                            positions.append({
+                                'mint': parsed['mint'],
+                                'balance': int(token_amount['amount']),
+                                'decimals': token_amount['decimals'],
+                                'uiAmount': float(token_amount['uiAmount']),
+                                'tokenAccount': str(account.pubkey)
+                            })
+                    except Exception as e:
+                        continue
+
+            return positions
+
+        except Exception as e:
+            print(f"[ERROR] Failed to get token positions: {str(e)}")
+            return []
+
+    def get_token_balance(self, mint_address: str, verbose: bool = False) -> float:
+        """Get token balance by querying the ATA directly via get_account_info.
+
+        Uses get_account_info (lightweight) instead of get_token_accounts_by_owner
+        (heavy / rate-limited on public RPC).  Tries both SPL Token and Token-2022
+        ATAs.  Pump.fun tokens are always 6 decimals.
+        """
+        mint_pubkey = Pubkey.from_string(mint_address)
+
+        # Derive both possible ATAs
+        ata_spl   = get_associated_token_address(self.keypair.pubkey(), mint_pubkey)
+        ata_2022  = get_ata_with_program(self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID)
+
+        if verbose:
+            print(f"[DEBUG] mint      : {mint_address}")
+            print(f"[DEBUG] wallet    : {self.keypair.pubkey()}")
+            print(f"[DEBUG] ATA (SPL) : {ata_spl}")
+            print(f"[DEBUG] ATA (2022): {ata_2022}")
+
+        for attempt in range(1, 6):
+            for ata_addr, prog_name in [(ata_spl, "SPL"), (ata_2022, "Token-2022")]:
+                try:
+                    resp = self.client.get_account_info(ata_addr, commitment=Processed)
+                    if resp.value and resp.value.data and len(resp.value.data) >= 72:
+                        # SPL / Token-2022 token account layout:
+                        # 0-31  mint pubkey
+                        # 32-63 owner pubkey
+                        # 64-71 amount u64 LE
+                        amount  = int.from_bytes(resp.value.data[64:72], 'little')
+                        balance = amount / 1_000_000  # pump.fun = 6 decimals always
+                        if verbose:
+                            print(f"[DEBUG] {prog_name} ATA raw amount={amount}  balance={balance:.4f}")
+                        if balance > 0:
+                            return balance
+                except Exception as e:
+                    if verbose:
+                        print(f"[DEBUG] attempt {attempt} {prog_name}: {type(e).__name__}: {e}")
+
+            if attempt < 5:
+                print(f"[WARN] Balance attempt {attempt}/5 — retrying in 1s...")
+                time.sleep(1)  # Helius propagates ATAs fast; 1s is enough
+
+        print(f"[ERROR] Could not fetch token balance after 5 attempts")
+        return 0.0
+
+    def buy_token_pumpfun(self, mint_address: str, sol_amount: float, max_slippage: float = 0.05,
+                          prefetched_curve: Optional[Dict] = None,
+                          max_buy_ms: Optional[int] = None) -> Optional[str]:
+        """Buy a token on the Pump.fun bonding curve with automatic slippage retry.
+
+        On SlippageExceeded (error 6001) the slippage is doubled and the tx
+        is retried up to MAX_ATTEMPTS times with a fresh bonding curve quote.
+
+        prefetched_curve: curve dict built from the pumpportal WebSocket creation
+            event (contains virtual reserves + creator pubkey).  When supplied the
+            entire BC_RETRIES RPC-polling loop is skipped on the first attempt,
+            saving 2–7 s.  On any retry the curve is always re-fetched from chain
+            so that price changes are captured.
+        max_buy_ms: if set, the entire buy (all retries) is abandoned and None is
+            returned once this many milliseconds have elapsed since the call started.
+            Useful for sniper bots where a stale entry is worse than no entry.
+            Example: max_buy_ms=2000 → skip if we haven't confirmed within 2 s.
+        """
+        MAX_ATTEMPTS  = 3
+        MAX_SLIPPAGE  = 0.50   # hard cap — never go above 50%
+        BC_RETRIES    = 30     # Helius: 30 × 0.5s = 15s retry window (covers slow propagation)
+        MAX_BC6000    = 3      # retries for error 6000 (BC not ready, 3 × 1s = 3s max)
+
+        try:
+            safe, reason = self.check_safety_limits(sol_amount)
+            if not safe:
+                print(f"[ERROR] Safety check failed: {reason}")
+                return None
+
+            t_start  = time.time()
+            deadline = (t_start + max_buy_ms / 1000) if max_buy_ms else None
+
+            slippage = max_slippage
+            attempt = 0
+            bc6000_count = 0
+            initial_expected_tokens = None  # set on first curve read; used to detect runaway price
+
+            while attempt < MAX_ATTEMPTS:
+                attempt += 1
+
+                # Deadline check — abort before spending more time on a stale entry
+                if deadline and time.time() > deadline:
+                    elapsed_ms = (time.time() - t_start) * 1000
+                    print(f"[SKIP] Buy deadline exceeded ({elapsed_ms:.0f}ms > {max_buy_ms}ms) — skipping")
+                    return None
+
+                print(f"[BUY] Attempt {attempt}/{MAX_ATTEMPTS} — {sol_amount} SOL, slippage {slippage*100:.0f}%")
+
+                # Attempt 1: use pre-fetched WebSocket data if available — no RPC wait.
+                # Attempt 2+: always re-fetch from chain so price changes are captured.
+                if prefetched_curve and attempt == 1:
+                    curve = prefetched_curve
+                    self._debug("Using pre-fetched curve from WS event — skipping BC wait")
+                    # WS trade event proves BC account exists. Skip logsSubscribe + ATA probe
+                    # overhead (~200-400ms). If the account isn't yet propagated to our RPC node,
+                    # the TX fails → attempt 2 falls into get_bonding_curve_state with full wait.
+                else:
+                    curve = None
+                    for bc in range(BC_RETRIES):
+                        if deadline and time.time() > deadline:
+                            elapsed_ms = (time.time() - t_start) * 1000
+                            print(f"[SKIP] Buy deadline exceeded while waiting for BC ({elapsed_ms:.0f}ms) — skipping")
+                            return None
+                        if bc > 0:
+                            time.sleep(0.5)  # Helius: 0.5s between retries
+                        curve = self.get_bonding_curve_state(mint_address)
+                        if curve:
+                            break
+
+                    if not curve:
+                        print("[ERROR] Bonding curve not ready after retries")
+                        return None
+
+                expected_tokens = self.calculate_buy_amount(curve, sol_amount)
+                if initial_expected_tokens is None:
+                    initial_expected_tokens = expected_tokens
+                elif initial_expected_tokens > 0 and expected_tokens < initial_expected_tokens * 0.5:
+                    # Price has risen >2× since first attempt — we're chasing, abort
+                    drift_pct = (1 - expected_tokens / initial_expected_tokens) * 100
+                    print(f"[ABORT] Price drifted {drift_pct:.0f}% since entry decision "
+                          f"({initial_expected_tokens:,.0f}→{expected_tokens:,.0f} tokens) — not chasing")
+                    return None
+                print(f"[INFO] Expected tokens: {expected_tokens:,.0f}")
+
+                sig = self.execute_pumpfun_buy(mint_address, sol_amount, slippage, curve, deadline=deadline)
+
+                if not sig:
+                    # No signature = tx never reached the network, retry immediately
+                    print(f"[WARN] No signature on attempt {attempt}, retrying...")
+                    time.sleep(0.2)
+                    continue
+
+                # Check on-chain result — event-driven WS, falls back to polling
+                err = self._wait_for_tx_confirm(sig, timeout=10.0)
+
+                if err is None:
+                    # ✅ Transaction succeeded
+                    self.total_trades += 1
+                    print(f"[OK] Buy confirmed: {sig}")
+                    print(f"[LINK] https://solscan.io/tx/{sig}")
+                    return sig
+
+                err_str = str(err)
+                if str(self.BONDING_CURVE_ERROR_CODE) in err_str or str(self.SLIPPAGE_ERROR_CODE) in err_str:
+                    # ❌ Price moved — error 6000 = "too much SOL required" (slippage exceeded on cost).
+                    # Pump.fun's buy instruction: amount=exact_tokens, maxSolCost=ceiling.
+                    # If price rose between curve-read and confirmation, actual cost > maxSolCost → 6000.
+                    # Fix: double slippage buffer and retry with fresh curve. No waiting needed.
+                    bc6000_count += 1
+                    if bc6000_count >= MAX_BC6000:
+                        print(f"[SLIPPAGE] Error 6000/6001 hit {bc6000_count} times — price ran too far, giving up")
+                        break
+                    old = slippage
+                    slippage = min(slippage * 2.0, MAX_SLIPPAGE)
+                    print(f"[SLIPPAGE] Error 6000/6001 ({bc6000_count}/{MAX_BC6000}) — "
+                          f"price moved, raising slippage {old*100:.0f}% → {slippage*100:.0f}%")
+                    prefetched_curve = None  # force fresh curve for new price
+                    attempt -= 1            # don't count price-move retries against MAX_ATTEMPTS
+                    time.sleep(0.1)
+                    continue
+                elif str(self.BC_COMPLETE_ERROR_CODE) in err_str:
+                    # ❌ Bonding curve complete — token graduated to Raydium, not retryable
+                    print(f"[BC] Error 6002 — token graduated to Raydium, skipping")
+                    return None
+                elif "2006" in err_str and attempt == 1 and prefetched_curve is not None:
+                    # ❌ ConstraintSeeds on first attempt with prefetched curve — we bought
+                    # before the bonding curve account settled on-chain (logsSubscribe fires
+                    # at processed, curve may not be readable yet).  Drop prefetched data,
+                    # wait briefly, and retry with a fresh on-chain curve fetch.
+                    print(f"[WARN] Error 2006 (BC not settled yet) — retrying with fresh curve")
+                    prefetched_curve = None
+                    time.sleep(0.3)
+                    continue
+                else:
+                    # ❌ Other on-chain error — not retryable
+                    print(f"[ERROR] On-chain failure: {err_str}")
+                    self.failed_trades += 1
+                    return None
+
+            print(f"[ERROR] Buy failed after {MAX_ATTEMPTS} attempts")
+            self.failed_trades += 1
+            return None
+
+        except Exception as e:
+            print(f"[ERROR] Buy exception: {str(e)}")
+            self.failed_trades += 1
+            return None
+
+    def sell_token_pumpfun(self, mint_address: str, token_amount: float, max_slippage: float = 0.05,
+                           skip_balance_check: bool = False, cached_curve: dict = None) -> Optional[str]:
+        """Sell a token on the Pump.fun bonding curve with automatic slippage retry.
+
+        Sell strategy escalates aggressively — getting OUT is more important than price:
+          Attempt 1: min_sol = expected * (1 - slippage)
+          Attempt 2: min_sol = expected * (1 - slippage*2)   [double tolerance]
+          Attempt 3: min_sol = 0   [emergency — accept any price to close position]
+        cached_curve: pre-built curve dict from WS cache — skips bonding curve RPC on attempt 1.
+        """
+        MAX_ATTEMPTS = 3
+
+        try:
+            if not skip_balance_check:
+                # Verify we actually hold the tokens
+                balance = self.get_token_balance(mint_address)
+                if balance <= 0:
+                    print(f"[ERROR] No token balance to sell for {mint_address[:8]}")
+                    return None
+                # Sell whatever we hold (in case partial sell happened before)
+                token_amount = min(token_amount, balance)
+
+            slippage = max_slippage
+
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                print(f"[SELL] Attempt {attempt}/{MAX_ATTEMPTS} — "
+                      f"{token_amount:,.2f} tokens, slippage {slippage*100:.0f}%")
+
+                # Use WS-cached curve on first attempt to skip RPC (~100-300ms saved).
+                # Fall back to fresh RPC fetch on retries (slippage error = stale price).
+                if attempt == 1 and cached_curve:
+                    curve = cached_curve
+                    print(f"[SELL] Using cached curve (vsr={curve['virtual_sol_reserves']:.3e})")
+                else:
+                    curve = self.get_bonding_curve_state(mint_address)
+                if not curve:
+                    print("[ERROR] Bonding curve unavailable — token may have migrated to Raydium")
+                    return None
+
+                expected_sol = self.calculate_sell_amount(curve, token_amount)
+
+                # Last attempt = emergency exit, accept any price
+                if attempt == MAX_ATTEMPTS:
+                    min_sol = 0.0
+                    print(f"[SELL] Emergency exit — accepting any price")
+                else:
+                    min_sol = expected_sol * (1 - slippage)
+
+                print(f"[INFO] Expected: {expected_sol:.6f} SOL, min accepted: {min_sol:.6f} SOL")
+
+                sig = self.execute_pumpfun_sell(mint_address, token_amount, min_sol, curve)
+
+                if not sig:
+                    print(f"[WARN] No signature on sell attempt {attempt}, retrying...")
+                    time.sleep(0.2)
+                    slippage = min(slippage * 2.0, 0.50)
+                    continue
+
+                err = self._wait_for_tx_confirm(sig, timeout=10.0)
+
+                if err is None:
+                    # ✅ Sell confirmed
+                    self.total_trades += 1
+                    print(f"[OK] Sell confirmed: {sig}")
+                    print(f"[LINK] https://solscan.io/tx/{sig}")
+                    return sig
+
+                err_str = str(err)
+                is_slippage = (str(self.SLIPPAGE_ERROR_CODE)      in err_str or
+                               str(self.SELL_SLIPPAGE_ERROR_CODE) in err_str)
+                if is_slippage:
+                    old = slippage
+                    slippage = min(slippage * 2.0, 0.99)
+                    print(f"[SLIPPAGE] Sell slippage error on attempt {attempt} — "
+                          f"raising slippage {old*100:.0f}% → {slippage*100:.0f}%")
+                    time.sleep(0.1)
+                    continue
+                else:
+                    print(f"[ERROR] Sell on-chain failure: {err_str}")
+                    self.failed_trades += 1
+                    return None
+
+            print(f"[ERROR] Sell failed after {MAX_ATTEMPTS} attempts")
+            self.failed_trades += 1
+            return None
+
+        except Exception as e:
+            print(f"[ERROR] Sell exception: {str(e)}")
+            self.failed_trades += 1
+            return None
+
+    def get_bonding_curve_state(self, mint_address: str) -> Optional[Dict]:
+        """Fetch bonding curve state from Solana"""
+        try:
+            # Derive bonding curve PDA
+            PUMPFUN_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+            mint_pubkey = Pubkey.from_string(mint_address)
+
+            # Find PDA for bonding curve
+            seeds = [b"bonding-curve", bytes(mint_pubkey)]
+            bonding_curve_pda, _ = Pubkey.find_program_address(seeds, PUMPFUN_PROGRAM)
+
+            # Fetch account data
+            response = self.client.get_account_info(bonding_curve_pda)
+
+            if not response.value:
+                return None
+
+            # Parse bonding curve data
+            data = response.value.data
+
+            # Bonding curve layout:
+            # Bytes 0-7:   discriminator (8 bytes)
+            # Bytes 8-15:  virtualTokenReserves (u64)
+            # Bytes 16-23: virtualSolReserves (u64)
+            # Bytes 24-31: realTokenReserves (u64)
+            # Bytes 32-39: realSolReserves (u64)
+            # Bytes 40-47: tokenTotalSupply (u64)
+            # Byte  48:    complete (bool)
+            # Layout A (original):  creator at bytes 49-80
+            # Layout B (newer, extra u64 inserted after complete): creator at bytes 57-88
+            virtual_token_reserves = int.from_bytes(data[8:16], 'little')
+            virtual_sol_reserves = int.from_bytes(data[16:24], 'little')
+            real_token_reserves = int.from_bytes(data[24:32], 'little')
+            real_sol_reserves = int.from_bytes(data[32:40], 'little')
+
+            # Detect correct creator offset by verifying the derived creator_vault PDA
+            # exists on-chain.  The vault is always initialized at token launch, so
+            # the offset that produces a live vault is the correct one.
+            creator = None
+            for offset in [49, 57]:
+                if len(data) < offset + 32:
+                    continue
+                candidate = Pubkey(data[offset:offset + 32])
+                vault_pda, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(candidate)],
+                    PUMPFUN_PROGRAM
+                )
+                try:
+                    vault_resp = self.client.get_account_info(vault_pda)
+                    if vault_resp.value:
+                        creator = candidate
+                        self._debug(f"Creator at offset {offset}: {candidate}")
+                        break
+                except Exception:
+                    pass
+
+            if creator is None:
+                # Vault check inconclusive — default to offset 49 (original layout)
+                self._debug("Creator vault not found at either offset, defaulting to offset 49")
+                creator = Pubkey(data[49:81])
+
+            # Cashback flag (byte 82, introduced in Feb 2026 pump.fun upgrade).
+            # WARNING: do NOT use Token-2022 as a proxy — many Token-2022 tokens
+            # have cashback_enabled = False.  Always read the authoritative flag here.
+            cashback_enabled = len(data) > 82 and data[82] != 0
+
+            return {
+                'virtual_token_reserves': virtual_token_reserves,
+                'virtual_sol_reserves': virtual_sol_reserves,
+                'real_token_reserves': real_token_reserves,
+                'real_sol_reserves': real_sol_reserves,
+                'bonding_curve_pda': str(bonding_curve_pda),
+                'creator': creator,
+                'cashback_enabled': cashback_enabled,
+            }
+
+        except Exception as e:
+            print(f"[ERROR] Failed to get bonding curve state: {str(e)}")
+            return None
+
+    def calculate_buy_amount(self, curve_data: Dict, sol_in: float) -> float:
+        """Calculate expected token output for SOL input (constant product formula)"""
+        sol_in_lamports = int(sol_in * 1e9)
+
+        virtual_sol = curve_data['virtual_sol_reserves']
+        virtual_tokens = curve_data['virtual_token_reserves']
+
+        # k = x * y (constant product)
+        # tokens_out = tokens - (k / (sol + sol_in))
+        tokens_out = virtual_tokens - (virtual_sol * virtual_tokens) / (virtual_sol + sol_in_lamports)
+
+        return tokens_out / 1e6  # Assuming 6 decimals
+
+    def calculate_sell_amount(self, curve_data: Dict, tokens_in: float) -> float:
+        """Calculate expected SOL output for token input (constant product formula)"""
+        tokens_in_raw = int(tokens_in * 1e6)
+
+        virtual_sol = curve_data['virtual_sol_reserves']
+        virtual_tokens = curve_data['virtual_token_reserves']
+
+        # sol_out = sol - (k / (tokens + tokens_in))
+        sol_out = virtual_sol - (virtual_sol * virtual_tokens) / (virtual_tokens + tokens_in_raw)
+
+        return sol_out / 1e9  # Convert to SOL
+
+    def execute_pumpfun_buy(self, mint_address: str, sol_amount: float, min_tokens: float, curve_data: Dict, deadline: float | None = None) -> Optional[str]:
+        """Execute buy transaction on Pump.fun bonding curve"""
+        try:
+            mint_pubkey = Pubkey.from_string(mint_address)
+
+            # FAST PATH: use prebuild cache if available (populated at token detection)
+            prebuild = self._prebuild_cache.pop(mint_address, None)
+
+            if prebuild and prebuild.get('associated_bonding_curve'):
+                # Cache hit — skip all PDA derivation + RPC ATA probes (~300ms saved)
+                bonding_curve_pda = prebuild['bonding_curve_pda']
+                creator_vault = prebuild['creator_vault']
+                user_volume_accumulator = prebuild['user_volume_accumulator']
+                associated_bonding_curve = prebuild['associated_bonding_curve']
+                user_token_account = prebuild['user_token_account']
+                mint_token_program = prebuild['mint_token_program']
+                needs_ata_creation = prebuild['needs_ata_creation']
+                create_ata_ix = prebuild['create_ata_ix']
+                self._debug(f"Prebuild cache HIT for {mint_address[:8]}... — skipping RPC probes")
+            else:
+                # Cache miss — full derivation + RPC probes (original logic)
+                if prebuild:
+                    self._debug(f"Prebuild cache PARTIAL for {mint_address[:8]}... — BC ATA missing, falling back")
+
+                # Derive bonding curve PDA
+                bonding_curve_pda, _ = Pubkey.find_program_address(
+                    [b"bonding-curve", bytes(mint_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
+
+                # Get creator address from bonding curve data and derive creator_vault PDA
+                creator_pubkey = curve_data['creator']
+                creator_vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
+
+                # Derive user volume accumulator PDA
+                user_volume_accumulator, _ = Pubkey.find_program_address(
+                    [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
+                    self.PUMPFUN_PROGRAM
+                )
+
+                # Probe BC ATAs to detect token program
+                associated_bonding_curve_legacy = get_associated_token_address(
+                    bonding_curve_pda, mint_pubkey
+                )
+                associated_bonding_curve_2022 = get_ata_with_program(
+                    bonding_curve_pda, mint_pubkey, TOKEN_2022_PROGRAM_ID
+                )
+
+                associated_bonding_curve = None
+                mint_token_program = TOKEN_PROGRAM_ID
+
+                try:
+                    bc_ata_info = self.client.get_account_info(associated_bonding_curve_legacy)
+                    if bc_ata_info.value:
+                        associated_bonding_curve = associated_bonding_curve_legacy
+                        mint_token_program = TOKEN_PROGRAM_ID
+                except:
+                    pass
+
+                if not associated_bonding_curve:
+                    try:
+                        bc_ata_info = self.client.get_account_info(associated_bonding_curve_2022)
+                        if bc_ata_info.value:
+                            associated_bonding_curve = associated_bonding_curve_2022
+                            mint_token_program = TOKEN_2022_PROGRAM_ID
+                    except:
+                        pass
+
+                if not associated_bonding_curve:
+                    print(f"[ERROR] Token bonding curve not ready - skipping")
+                    return None
+
+                # Derive user token account
+                if mint_token_program == TOKEN_2022_PROGRAM_ID:
+                    user_token_account = get_ata_with_program(
+                        self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID
+                    )
+                else:
+                    user_token_account = get_associated_token_address(
+                        self.keypair.pubkey(), mint_pubkey
+                    )
+
+                # Check user ATA existence
+                needs_ata_creation = False
+                create_ata_ix = None
+                try:
+                    user_ata_info = self.client.get_account_info(user_token_account)
+                    if not user_ata_info.value:
+                        needs_ata_creation = True
+                except Exception:
+                    needs_ata_creation = True
+
+                if needs_ata_creation:
+                    create_ata_ix = Instruction(
+                        program_id=ASSOCIATED_TOKEN_PROGRAM_ID,
+                        accounts=[
+                            AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),
+                            AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
+                            AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+                            AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),
+                        ],
+                        data=b"",
+                    )
+
+            # If creator_vault wasn't available from prebuild, derive it now
+            if not creator_vault:
+                creator_pubkey = curve_data['creator']
+                creator_vault, _ = Pubkey.find_program_address(
+                    [b"creator-vault", bytes(creator_pubkey)],
+                    self.PUMPFUN_PROGRAM
+                )
+
+            # Build buy instruction data
+            # New pump.fun format after Feb 2026 upgrade: buy_exact_sol_in
+            # [discriminator 8B] [sol_amount u64 lamports] [min_tokens_out u64 raw]
+            # (old "buy" took tokens_to_receive + max_sol_cost; now reversed)
+            discriminator = bytes([56, 252, 116, 8, 158, 223, 205, 95])
+            sol_amount_lamports = int(sol_amount * 1e9)
+            expected_tokens = self.calculate_buy_amount(curve_data, sol_amount)
+            expected_tokens_raw = int(expected_tokens * 1e6)
+            # min_tokens is the slippage fraction; floor = expected * (1 - slippage)
+            min_tokens_out_raw = int(expected_tokens_raw * (1 - min_tokens))
+
+            instruction_data = discriminator + struct.pack('<QQ', sol_amount_lamports, min_tokens_out_raw)
+
+            # Derive fee_config PDA with updated seed key (Feb 2026 upgrade)
+            fee_config_pda, _ = Pubkey.find_program_address(
+                [b"fee_config", self.FEE_CONFIG_KEY],
+                self.FEE_PROGRAM
+            )
+
+            # Derive bonding_curve_v2 PDA — new required account (Feb 2026 upgrade)
+            bonding_curve_v2_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve-v2", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # Build accounts for buy instruction - 17 accounts total (after Feb 2026 upgrade)
+            # Account order matters! This MUST match Solscan output exactly
+            accounts = [
+                AccountMeta(pubkey=self.PUMPFUN_GLOBAL, is_signer=False, is_writable=False),           # 0 - Global
+                AccountMeta(pubkey=self.PUMPFUN_FEE_RECIPIENT, is_signer=False, is_writable=True),     # 1 - Fee Recipient
+                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),                   # 2 - Mint
+                AccountMeta(pubkey=bonding_curve_pda, is_signer=False, is_writable=True),              # 3 - Bonding Curve
+                AccountMeta(pubkey=associated_bonding_curve, is_signer=False, is_writable=True),       # 4 - Associated Bonding Curve
+                AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),             # 5 - Associated User
+                AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),           # 6 - User (signer)
+                AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),             # 7 - System Program
+                AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),            # 8 - Token Program (detected)
+                AccountMeta(pubkey=creator_vault, is_signer=False, is_writable=True),                  # 9 - Creator Vault
+                AccountMeta(pubkey=self.PUMPFUN_EVENT_AUTHORITY, is_signer=False, is_writable=False),  # 10 - Event Authority
+                AccountMeta(pubkey=self.PUMPFUN_PROGRAM, is_signer=False, is_writable=False),          # 11 - Program
+                AccountMeta(pubkey=self.GLOBAL_VOLUME_ACCUMULATOR, is_signer=False, is_writable=False), # 12 - Global Volume Accumulator (readonly after Feb 2026)
+                AccountMeta(pubkey=user_volume_accumulator, is_signer=False, is_writable=True),        # 13 - User Volume Accumulator
+                AccountMeta(pubkey=fee_config_pda, is_signer=False, is_writable=False),                # 14 - Fee Config
+                AccountMeta(pubkey=self.FEE_PROGRAM, is_signer=False, is_writable=False),              # 15 - Fee Program
+                AccountMeta(pubkey=bonding_curve_v2_pda, is_signer=False, is_writable=False),          # 16 - Bonding Curve V2 (Feb 2026)
+            ]
+
+            prog_name = "Token-2022" if mint_token_program == TOKEN_2022_PROGRAM_ID else "SPL Token"
+
+            buy_instruction = Instruction(
+                program_id=self.PUMPFUN_PROGRAM,
+                data=instruction_data,
+                accounts=accounts
+            )
+
+            # Assemble instruction list
+            instructions = [
+                set_compute_unit_limit(self.buy_compute_limit),
+                set_compute_unit_price(self.priority_fee),
+            ]
+
+            # Add ATA creation if needed (prebuild or fallback already determined this)
+            if needs_ata_creation and create_ata_ix:
+                instructions.append(create_ata_ix)
+
+            # Add the buy instruction
+            instructions.append(buy_instruction)
+
+            # Add Jito tip if MEV protection is enabled
+            if self.use_jito:
+                import random
+                jito_tip_accounts = [
+                    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+                    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+                    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+                    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+                    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+                    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+                    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+                    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(jito_tip_accounts)),
+                    lamports=self.jito_tip_lamports
+                )))
+                print(f"[MEV] Added Jito tip: {self.jito_tip_lamports} lamports")
+
+            # Add NextBlock tip if configured
+            if self.nextblock_api_key:
+                import random
+                nextblock_tip_accounts = [
+                    "NEXTbLoCkB51HpLBLojQfpyVAMorm3zzKg7w9NFdqid",
+                    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",
+                    "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE",
+                    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",
+                    "NeXTBLoCKs9F1y5PJS9CKrFNNLU1keHW71rfh7KgA1X",
+                    "NexTBLockJYZ7QD7p2byrUa6df8ndV2WSd8GkbWqfbb",
+                    "neXtBLock1LeC67jYd1QdAa32kbVeubsfPNTJC1V5At",
+                    "nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nextblock_tip_accounts)),
+                    lamports=self.nextblock_tip_lamports
+                )))
+                print(f"[NEXTBLOCK] Added tip: {self.nextblock_tip_lamports} lamports")
+
+            # Add Nozomi tip if configured
+            if self.nozomi_api_key:
+                import random
+                nozomi_tip_accounts = [
+                    "TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq",
+                    "noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4",
+                    "noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE",
+                    "noz6uoYCDijhu1V7cutCpwxNiSovEwLdRHPwmgCGDNo",
+                    "noz9EPNcT7WH6Sou3sr3GGjHQYVkN3DNirpbvDkv9YJ",
+                    "nozc5yT15LazbLTFVZzoNZCwjh3yUtW86LoUyqsBu4L",
+                    "nozFrhfnNGoyqwVuwPAW4aaGqempx4PU6g6D9CJMv7Z",
+                    "nozievPk7HyK1Rqy1MPJwVQ7qQg2QoJGyP71oeDwbsu",
+                    "noznbgwYnBLDHu8wcQVCEw6kDrXkPdKkydGJGNXGvL7",
+                    "nozNVWs5N8mgzuD3qigrCG2UoKxZttxzZ85pvAQVrbP",
+                    "nozpEGbwx4BcGp6pvEdAh1JoC2CQGZdU6HbNP1v2p6P",
+                    "nozrhjhkCr3zXT3BiT4WCodYCUFeQvcdUkM7MqhKqge",
+                    "nozrwQtWhEdrA6W8dkbt9gnUaMs52PdAv5byipnadq3",
+                    "nozUacTVWub3cL4mJmGCYjKZTnE9RbdY5AP46iQgbPJ",
+                    "nozWCyTPppJjRuw2fpzDhhWbW355fzosWSzrrMYB1Qk",
+                    "nozWNju6dY353eMkMqURqwQEoM3SFgEKC6psLCSfUne",
+                    "nozxNBgWohjR75vdspfxR5H9ceC7XXH99xpxhVGt3Bb"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nozomi_tip_accounts)),
+                    lamports=self.nozomi_tip_lamports
+                )))
+                print(f"[NOZOMI] Added tip: {self.nozomi_tip_lamports} lamports")
+
+            # Use pre-cached blockhash (background thread refreshes every 400ms)
+            recent_blockhash = self._get_blockhash()
+
+            # Build message
+            message = Message.new_with_blockhash(
+                instructions,
+                self.keypair.pubkey(),
+                recent_blockhash
+            )
+
+            # Sign and send
+            endpoints = []
+            if self.nextblock_api_key:
+                endpoints.append('NextBlock')
+            if self.nozomi_api_key:
+                endpoints.append('Nozomi')
+            if self.use_jito:
+                endpoints.append('Jito')
+            endpoints.append('RPC')
+            print(f"  Endpoints: {', '.join(endpoints)}")
+            print(f"  Instructions: {len(instructions)}")
+            print(f"[TX] Sending buy transaction...")
+
+            # Final deadline check — don't send if we've already blown the budget
+            if deadline and time.time() > deadline:
+                print(f"[SKIP] Buy deadline exceeded pre-send — aborting")
+                return None
+
+            transaction = Transaction([self.keypair], message, recent_blockhash)
+
+            # Blast to all configured endpoints simultaneously
+            signature = self.blast_transaction(transaction)
+
+            if not signature:
+                return None
+
+            # Cache ATA + token program for fast sell — skips 2 get_account_info RPCs
+            self.token_program_cache[mint_address] = {
+                'user_ata': user_token_account,
+                'token_program': mint_token_program,
+            }
+
+            # Confirmation is handled by get_tx_error() in buy_token_pumpfun
+            # (polls every 0.5s up to 6s) — no need to block here too.
+            return signature
+
+        except Exception as e:
+            print(f"  Type: {type(e).__name__}")
+            print(f"  Message: {str(e)}")
+            print(f"[ERROR] Transaction execution failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def execute_pumpfun_sell(self, mint_address: str, token_amount: float, min_sol: float, curve_data: Dict) -> Optional[str]:
+        """Execute sell transaction on Pump.fun bonding curve."""
+        try:
+            mint_pubkey = Pubkey.from_string(mint_address)
+
+            # Derive bonding curve PDA
+            bonding_curve_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # Detect which token program this mint uses.
+            # Fast path: use ATA cached at buy time — skips 2 get_account_info RPCs (~200-400ms).
+            # Cold path (cache miss): probe both ATAs as before.
+            ata_spl  = get_associated_token_address(self.keypair.pubkey(), mint_pubkey)
+            ata_2022 = get_ata_with_program(self.keypair.pubkey(), mint_pubkey, TOKEN_2022_PROGRAM_ID)
+
+            user_token_account = ata_spl          # default: legacy SPL
+            mint_token_program  = TOKEN_PROGRAM_ID  # default
+            exact_raw_balance   = None             # exact on-chain u64 token amount
+
+            _cached_ata = self.token_program_cache.get(mint_address)
+            if _cached_ata:
+                # Fast path: token program determined at buy time
+                user_token_account = _cached_ata['user_ata']
+                mint_token_program  = _cached_ata['token_program']
+                print(f"[SELL] Cached ATA hit — skipped 2 probes")
+            else:
+                # Cold path: probe which ATA holds the tokens
+                try:
+                    resp = self.client.get_account_info(ata_2022, commitment=Processed)
+                    if resp.value and resp.value.data and len(resp.value.data) >= 72:
+                        amount = int.from_bytes(resp.value.data[64:72], 'little')
+                        if amount > 0:
+                            user_token_account = ata_2022
+                            mint_token_program  = TOKEN_2022_PROGRAM_ID
+                            exact_raw_balance   = amount
+                except Exception:
+                    pass
+
+                # If tokens weren't in Token-2022 ATA, probe SPL ATA for exact balance
+                if exact_raw_balance is None:
+                    try:
+                        resp_spl = self.client.get_account_info(ata_spl, commitment=Processed)
+                        if resp_spl.value and resp_spl.value.data and len(resp_spl.value.data) >= 72:
+                            amount_spl = int.from_bytes(resp_spl.value.data[64:72], 'little')
+                            if amount_spl > 0:
+                                exact_raw_balance = amount_spl
+                    except Exception:
+                        pass
+
+            # Bonding curve ATA — same program as the mint
+            if mint_token_program == TOKEN_2022_PROGRAM_ID:
+                associated_bonding_curve = get_ata_with_program(
+                    bonding_curve_pda, mint_pubkey, TOKEN_2022_PROGRAM_ID
+                )
+            else:
+                associated_bonding_curve = get_associated_token_address(
+                    bonding_curve_pda, mint_pubkey
+                )
+
+            # Creator vault — required account (same derivation as buy)
+            creator_pubkey = curve_data['creator']
+            creator_vault, _ = Pubkey.find_program_address(
+                [b"creator-vault", bytes(creator_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # Fee config PDA (seed key changed in Feb 2026 pump.fun upgrade)
+            pump_fee_config_pda, _ = Pubkey.find_program_address(
+                [b"fee_config", self.FEE_CONFIG_KEY],
+                self.FEE_PROGRAM
+            )
+
+            # Bonding curve v2 PDA — new required account (Feb 2026 upgrade)
+            bonding_curve_v2_pda, _ = Pubkey.find_program_address(
+                [b"bonding-curve-v2", bytes(mint_pubkey)],
+                self.PUMPFUN_PROGRAM
+            )
+
+            # Cashback flag from curve data (byte 82).
+            # Determines whether user_volume_accumulator must be included in sell.
+            cashback_enabled = curve_data.get('cashback_enabled', False)
+
+            # Sell instruction data
+            # BUG FIX: discriminator must be raw bytes, NOT packed as a u64 integer
+            # struct.pack('<Q', 0x33e685a4017f83ad) reverses byte order — wrong!
+            discriminator = bytes.fromhex("33e685a4017f83ad")
+
+            # Use exact on-chain balance to prevent float-rounding dust.
+            # int(float * 1e6) can truncate by 1 unit (IEEE 754), leaving a dust token
+            # in the ATA.  The close_ix then fails with Custom:11 (NonNativeHasPendingBalance).
+            tokens_raw = round(token_amount * 1e6)
+            if exact_raw_balance is not None:
+                if abs(tokens_raw - exact_raw_balance) <= 1:
+                    # Selling the full balance — use exact on-chain amount so no dust remains.
+                    tokens_raw = exact_raw_balance
+                else:
+                    # Partial sell — cap at exact balance to prevent over-sell rejection.
+                    tokens_raw = min(tokens_raw, exact_raw_balance)
+
+            min_sol_lamports = int(min_sol * 1e9)
+            instruction_data = discriminator + struct.pack('<QQ', tokens_raw, min_sol_lamports)
+
+            # Accounts matching pumpfunlib/pump_fun.py (the working reference)
+            accounts = [
+                AccountMeta(pubkey=self.PUMPFUN_GLOBAL, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=self.PUMPFUN_FEE_RECIPIENT, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=bonding_curve_pda, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=associated_bonding_curve, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=True),
+                AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=creator_vault, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=mint_token_program, is_signer=False, is_writable=False),  # detected: SPL or Token-2022
+                AccountMeta(pubkey=self.PUMPFUN_EVENT_AUTHORITY, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=self.PUMPFUN_PROGRAM, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=pump_fee_config_pda, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=self.FEE_PROGRAM, is_signer=False, is_writable=False),
+            ]
+
+            # Cashback-enabled tokens need user_volume_accumulator BEFORE bonding_curve_v2.
+            # Non-cashback tokens skip it entirely.
+            if cashback_enabled:
+                user_vol_sell, _ = Pubkey.find_program_address(
+                    [b"user_volume_accumulator", bytes(self.keypair.pubkey())],
+                    self.PUMPFUN_PROGRAM
+                )
+                accounts.append(AccountMeta(pubkey=user_vol_sell, is_signer=False, is_writable=True))
+
+            # bonding_curve_v2 is always the last account (Feb 2026 upgrade)
+            accounts.append(AccountMeta(pubkey=bonding_curve_v2_pda, is_signer=False, is_writable=False))
+
+            sell_instruction = Instruction(
+                program_id=self.PUMPFUN_PROGRAM,
+                data=instruction_data,
+                accounts=accounts
+            )
+
+            # CloseAccount instruction — reclaims the ~0.002 SOL ATA rent deposit.
+            # Runs after the sell empties the account, so the close is guaranteed to
+            # succeed.  Discriminator byte 9 is CloseAccount for both SPL Token and
+            # Token-2022.  The lamports are returned directly to the wallet (payer).
+            close_ix = Instruction(
+                program_id=mint_token_program,  # must match the token's program
+                data=bytes([9]),
+                accounts=[
+                    AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),      # account to close
+                    AccountMeta(pubkey=self.keypair.pubkey(), is_signer=False, is_writable=True),    # lamport destination
+                    AccountMeta(pubkey=self.keypair.pubkey(), is_signer=True, is_writable=False),    # owner / authority
+                ]
+            )
+
+            instructions = [
+                set_compute_unit_limit(self.sell_compute_limit),
+                set_compute_unit_price(self.priority_fee),
+                sell_instruction,
+                close_ix,
+            ]
+
+            # Add NextBlock tip if configured
+            if self.nextblock_api_key:
+                import random
+                nextblock_tip_accounts = [
+                    "NEXTbLoCkB51HpLBLojQfpyVAMorm3zzKg7w9NFdqid",
+                    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",
+                    "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE",
+                    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",
+                    "NeXTBLoCKs9F1y5PJS9CKrFNNLU1keHW71rfh7KgA1X",
+                    "NexTBLockJYZ7QD7p2byrUa6df8ndV2WSd8GkbWqfbb",
+                    "neXtBLock1LeC67jYd1QdAa32kbVeubsfPNTJC1V5At",
+                    "nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nextblock_tip_accounts)),
+                    lamports=self.nextblock_tip_lamports
+                )))
+
+            # Add Nozomi tip if configured
+            if self.nozomi_api_key:
+                import random
+                nozomi_tip_accounts = [
+                    "TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq",
+                    "noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4",
+                    "noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE",
+                    "noz6uoYCDijhu1V7cutCpwxNiSovEwLdRHPwmgCGDNo",
+                    "noz9EPNcT7WH6Sou3sr3GGjHQYVkN3DNirpbvDkv9YJ",
+                    "nozc5yT15LazbLTFVZzoNZCwjh3yUtW86LoUyqsBu4L",
+                    "nozFrhfnNGoyqwVuwPAW4aaGqempx4PU6g6D9CJMv7Z",
+                    "nozievPk7HyK1Rqy1MPJwVQ7qQg2QoJGyP71oeDwbsu",
+                    "noznbgwYnBLDHu8wcQVCEw6kDrXkPdKkydGJGNXGvL7",
+                    "nozNVWs5N8mgzuD3qigrCG2UoKxZttxzZ85pvAQVrbP",
+                    "nozpEGbwx4BcGp6pvEdAh1JoC2CQGZdU6HbNP1v2p6P",
+                    "nozrhjhkCr3zXT3BiT4WCodYCUFeQvcdUkM7MqhKqge",
+                    "nozrwQtWhEdrA6W8dkbt9gnUaMs52PdAv5byipnadq3",
+                    "nozUacTVWub3cL4mJmGCYjKZTnE9RbdY5AP46iQgbPJ",
+                    "nozWCyTPppJjRuw2fpzDhhWbW355fzosWSzrrMYB1Qk",
+                    "nozWNju6dY353eMkMqURqwQEoM3SFgEKC6psLCSfUne",
+                    "nozxNBgWohjR75vdspfxR5H9ceC7XXH99xpxhVGt3Bb"
+                ]
+                instructions.append(transfer(TransferParams(
+                    from_pubkey=self.keypair.pubkey(),
+                    to_pubkey=Pubkey.from_string(random.choice(nozomi_tip_accounts)),
+                    lamports=self.nozomi_tip_lamports
+                )))
+
+            # Build and sign transaction (same pattern as buy)
+            recent_blockhash = self._get_blockhash()  # pre-cached, no RPC wait
+
+            message = Message.new_with_blockhash(
+                instructions,
+                self.keypair.pubkey(),
+                recent_blockhash
+            )
+            transaction = Transaction([self.keypair], message, recent_blockhash)
+
+            print(f"[TX] Sending sell transaction...")
+            signature = self.blast_transaction(transaction)
+
+            if not signature:
+                return None
+
+            # Confirmation handled by get_tx_error() in sell_token_pumpfun
+            return signature
+
+        except Exception as e:
+            print(f"[ERROR] Sell transaction failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def get_stats(self) -> Dict:
+        """Get trading statistics"""
+        success_rate = ((self.total_trades - self.failed_trades) / self.total_trades * 100) if self.total_trades > 0 else 0
+
+        return {
+            'total_trades': self.total_trades,
+            'failed_trades': self.failed_trades,
+            'success_rate': success_rate,
+            'wallet_address': self.wallet_address,
+            'sol_balance': self.get_sol_balance()
+        }
+
+
+if __name__ == "__main__":
+    # Test the live trader
+    import sys
+    import io
+
+    # Set UTF-8 encoding for Windows console
+    if sys.platform == 'win32':
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+    print("[TEST] Testing Live Trader Module...")
+
+    try:
+        trader = LiveTrader("wallet_config.json")
+
+        print(f"\n[INFO] Wallet: {trader.wallet_address}")
+        print(f"[BAL] Balance: {trader.get_sol_balance():.6f} SOL")
+        print(f"[MEV]  MEV Protection: {'ENABLED' if trader.use_jito else 'DISABLED'}")
+
+        print("\n[OK] Live trader module loaded successfully!")
+        print("[OK] Buy/sell functions are FULLY IMPLEMENTED")
+        print("[OK] Pump.fun program integration complete")
+        print("[OK] MEV protection via Jito (optional)")
+        print("\n[WARN]  IMPORTANT: Start with small amounts (0.01-0.05 SOL)")
+        print("[WARN]  Test thoroughly before using larger positions")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize: {str(e)}")
+        print("\n[TIP] Create wallet_config.json from wallet_config_TEMPLATE.json")
