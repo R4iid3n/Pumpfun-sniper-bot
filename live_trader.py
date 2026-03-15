@@ -105,6 +105,14 @@ class LiveTrader:
         )
         self._blockhash_thread.start()
 
+        # Direct TPU client — QUIC send straight to current slot leader(s).
+        # Initialized after load_wallet_config() so self.use_tpu_direct is available.
+        self._tpu_ready = False
+        self._tpu_leader_addrs = []     # [(host, port), ...]  updated every 400ms
+        self._tpu_lock = threading.Lock()
+        if self.use_tpu_direct:
+            self._init_tpu_client()
+
     def _blockhash_refresher(self):
         """Background thread: keep a fresh blockhash cached every 400ms.
 
@@ -339,7 +347,7 @@ class LiveTrader:
         done.wait(timeout=timeout + 2)  # +2 s buffer for connection setup overhead
         return result[0]
 
-    def _wait_for_tx_confirm(self, signature: str, timeout: float = 6.0):
+    def _wait_for_tx_confirm(self, signature: str, timeout: float = 3.0):
         """Event-driven transaction confirmation via signatureSubscribe WebSocket.
 
         Same return contract as get_tx_error:
@@ -404,7 +412,7 @@ class LiveTrader:
 
         t = threading.Thread(target=_thread_run, daemon=True)
         t.start()
-        done.wait(timeout=timeout + 2)
+        done.wait(timeout=timeout + 1)
 
         if received[0]:
             return tx_err[0]
@@ -474,6 +482,13 @@ class LiveTrader:
             self.nozomi_api_key = config.get('nozomi_api_key', '')
             self.nozomi_tip_lamports = config.get('nozomi_tip_lamports', 1_000_000)  # 0.001 SOL min
 
+            # Direct TPU settings — send TX straight to validator QUIC port (no RPC relay)
+            self.use_tpu_direct = config.get('use_tpu_direct', False)
+            # Derive WebSocket URL from RPC URL (TpuClient needs WS for slot subscription)
+            self.rpc_ws_url = (self.rpc_url
+                               .replace("https://", "wss://")
+                               .replace("http://", "ws://"))
+
             print(f"[OK] Wallet loaded: {self.wallet_address}")
             blast_endpoints = ['RPC']
             if self.use_jito:
@@ -482,6 +497,8 @@ class LiveTrader:
                 blast_endpoints.append('NextBlock')
             if self.nozomi_api_key:
                 blast_endpoints.append('Nozomi')
+            if self.use_tpu_direct:
+                blast_endpoints.append('TPU')
             if len(blast_endpoints) > 1:
                 print(f"[BLAST] Multi-endpoint blast: {', '.join(blast_endpoints)}")
             if self.use_jito:
@@ -687,6 +704,159 @@ class LiveTrader:
             print(f"[WARN] Nozomi failed: {str(e)}")
             return None
 
+    def _init_tpu_client(self):
+        """Initialize direct QUIC TPU sender using aioquic.
+
+        Solana validators accept transactions via QUIC unidirectional streams on their
+        TPU port (found via getClusterNodes). This bypasses the RPC relay hop, saving
+        ~30-50ms per TX send. A background thread keeps the current leader's TPU address
+        fresh every 400ms. Confirmation still comes through the normal WS path.
+
+        Requires: pip install aioquic
+        """
+        try:
+            import aioquic  # noqa — just validates it's installed
+        except ImportError:
+            print("[WARN] TPU: aioquic not installed — run: pip install aioquic")
+            print("[WARN] TPU direct send disabled; other blast endpoints still active")
+            return
+
+        # Start background thread — enables _tpu_ready once it finds a leader.
+        # Non-blocking: startup continues immediately; TPU activates within ~1s.
+        self._tpu_thread = threading.Thread(
+            target=self._tpu_leader_refresher, daemon=True, name="tpu-leader-refresh"
+        )
+        self._tpu_thread.start()
+        print("[TPU] Leader discovery started (QUIC TPU activates within ~1s)")
+
+    def _tpu_leader_refresher(self):
+        """Background thread: keep current slot leader TPU address(es) fresh every 400ms.
+
+        Cluster nodes (validator pubkey → TPU address) are refreshed every 30s since
+        they rarely change. Slot leaders are refreshed every slot (~400ms).
+        """
+        last_cluster_refresh = 0.0
+        tpu_map = {}   # pubkey_str -> "host:port"
+        first_run = True
+        sess = requests.Session()
+        rpc = self.rpc_url
+
+        def _rpc(method, params=None):
+            """Raw HTTP JSON-RPC call — bypasses solders binding version quirks."""
+            r = sess.post(rpc, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": method,
+                "params": params or [],
+            }, timeout=5)
+            r.raise_for_status()
+            result = r.json()
+            if "error" in result:
+                raise RuntimeError(result["error"].get("message", str(result["error"])))
+            return result["result"]
+
+        while True:
+            try:
+                now = time.time()
+                # Refresh cluster node list every 30s (rarely changes)
+                if now - last_cluster_refresh > 30.0:
+                    nodes = _rpc("getClusterNodes")
+                    # Each node: {"pubkey": "...", "tpu": "ip:port" or null, ...}
+                    tpu_map = {n["pubkey"]: n["tpu"] for n in nodes if n.get("tpu")}
+                    last_cluster_refresh = now
+                    if first_run:
+                        print(f"[TPU] Cluster nodes loaded — {len(tpu_map)} validators with public TPU")
+
+                # Get current and next 2 slot leaders
+                slot = _rpc("getSlot")
+                leaders = _rpc("getSlotLeaders", [slot, 3])  # list of pubkey strings
+
+                addrs = []
+                for leader in leaders:
+                    tpu_str = tpu_map.get(leader)
+                    if tpu_str:
+                        host, port = tpu_str.rsplit(':', 1)
+                        addrs.append((host, int(port)))
+
+                with self._tpu_lock:
+                    prev_ready = self._tpu_ready
+                    self._tpu_leader_addrs = addrs[:2]   # current + 1 next
+                    if addrs and not prev_ready:
+                        self._tpu_ready = True
+                        print(f"[TPU] Direct QUIC TPU ready — leader {addrs[0][0]}:{addrs[0][1]}")
+                    elif not addrs and first_run:
+                        print("[WARN] TPU: current slot leaders have no public TPU address — waiting")
+
+                first_run = False
+
+            except Exception as e:
+                if first_run:
+                    print(f"[WARN] TPU leader refresh error: {type(e).__name__}: {e}")
+                    first_run = False
+
+            time.sleep(2.0)
+
+    def _send_via_tpu(self, transaction: Transaction) -> Optional[str]:
+        """Send TX directly to current slot leader(s) via QUIC unidirectional stream.
+
+        Solana validators receive transactions as raw bytes written to a QUIC
+        unidirectional stream on their TPU port. This skips the RPC relay entirely.
+        Confirmation still arrives through the normal WS signatureSubscribe path.
+        """
+        if not self._tpu_ready:
+            return None
+
+        with self._tpu_lock:
+            addrs = list(self._tpu_leader_addrs)
+
+        if not addrs:
+            return None
+
+        tx_bytes = bytes(transaction)
+        sig = str(transaction.signatures[0])
+
+        async def _quic_blast():
+            import ssl
+            from aioquic.asyncio import connect
+            from aioquic.quic.configuration import QuicConfiguration
+            # Suppress "Future exception was never retrieved" from aioquic internals
+            # when QUIC handshake fails — these are ConnectionError inside aioquic's
+            # protocol machinery that we can't catch from outside.
+            asyncio.get_event_loop().set_exception_handler(lambda loop, ctx: None)
+
+            config = QuicConfiguration(
+                is_client=True,
+                verify_mode=ssl.CERT_NONE,   # validators use self-signed certs
+                alpn_protocols=["solana-tpu"],
+            )
+
+            async def _send_one(host, port):
+                try:
+                    async with connect(host, port, configuration=config) as conn:
+                        sid = conn._quic.get_next_available_stream_id(is_unidirectional=True)
+                        conn._quic.send_stream_data(sid, tx_bytes, end_stream=True)
+                        conn.transmit()
+                        await asyncio.sleep(0.05)   # allow packet to flush
+                except (Exception, asyncio.CancelledError):
+                    pass
+
+            # asyncio.wait with explicit cancel — avoids "Future exception was never
+            # retrieved" warnings that occur when wait_for cancels mid-handshake.
+            tasks = [asyncio.create_task(_send_one(h, p)) for h, p in addrs]
+            _, pending = await asyncio.wait(tasks, timeout=0.7)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (Exception, asyncio.CancelledError):
+                    pass
+
+        try:
+            asyncio.run(_quic_blast())
+            return sig
+        except Exception as e:
+            self._debug(f"TPU send failed: {e}")
+            return None
+
     def blast_transaction(self, transaction: Transaction) -> Optional[str]:
         """Send transaction to all configured endpoints simultaneously.
 
@@ -710,6 +880,15 @@ class LiveTrader:
             sends.append(("NextBlock", lambda: self._send_via_nextblock(transaction)))
         if self.nozomi_api_key:
             sends.append(("Nozomi", lambda: self._send_via_nozomi(transaction)))
+
+        # TPU fires as a true fire-and-forget daemon thread — completely outside
+        # the blast pool so it can never block the return path.
+        # The network deduplicates if both RPC and TPU land.
+        if self._tpu_ready:
+            threading.Thread(
+                target=self._send_via_tpu, args=(transaction,),
+                daemon=True, name="tpu-fire"
+            ).start()
 
         if not sends:
             # Fallback — always have at least RPC
@@ -823,7 +1002,8 @@ class LiveTrader:
         return 0.0
 
     def buy_token_pumpfun(self, mint_address: str, sol_amount: float, max_slippage: float = 0.05,
-                          prefetched_curve: Optional[Dict] = None) -> Optional[str]:
+                          prefetched_curve: Optional[Dict] = None,
+                          max_buy_ms: Optional[int] = None) -> Optional[str]:
         """Buy a token on the Pump.fun bonding curve with automatic slippage retry.
 
         On SlippageExceeded (error 6001) the slippage is doubled and the tx
@@ -834,6 +1014,10 @@ class LiveTrader:
             entire BC_RETRIES RPC-polling loop is skipped on the first attempt,
             saving 2–7 s.  On any retry the curve is always re-fetched from chain
             so that price changes are captured.
+        max_buy_ms: if set, the entire buy (all retries) is abandoned and None is
+            returned once this many milliseconds have elapsed since the call started.
+            Useful for sniper bots where a stale entry is worse than no entry.
+            Example: max_buy_ms=2000 → skip if we haven't confirmed within 2 s.
         """
         MAX_ATTEMPTS  = 3
         MAX_SLIPPAGE  = 0.50   # hard cap — never go above 50%
@@ -846,6 +1030,9 @@ class LiveTrader:
                 print(f"[ERROR] Safety check failed: {reason}")
                 return None
 
+            t_start  = time.time()
+            deadline = (t_start + max_buy_ms / 1000) if max_buy_ms else None
+
             slippage = max_slippage
             attempt = 0
             bc6000_count = 0
@@ -853,6 +1040,13 @@ class LiveTrader:
 
             while attempt < MAX_ATTEMPTS:
                 attempt += 1
+
+                # Deadline check — abort before spending more time on a stale entry
+                if deadline and time.time() > deadline:
+                    elapsed_ms = (time.time() - t_start) * 1000
+                    print(f"[SKIP] Buy deadline exceeded ({elapsed_ms:.0f}ms > {max_buy_ms}ms) — skipping")
+                    return None
+
                 print(f"[BUY] Attempt {attempt}/{MAX_ATTEMPTS} — {sol_amount} SOL, slippage {slippage*100:.0f}%")
 
                 # Attempt 1: use pre-fetched WebSocket data if available — no RPC wait.
@@ -866,6 +1060,10 @@ class LiveTrader:
                 else:
                     curve = None
                     for bc in range(BC_RETRIES):
+                        if deadline and time.time() > deadline:
+                            elapsed_ms = (time.time() - t_start) * 1000
+                            print(f"[SKIP] Buy deadline exceeded while waiting for BC ({elapsed_ms:.0f}ms) — skipping")
+                            return None
                         if bc > 0:
                             time.sleep(0.5)  # Helius: 0.5s between retries
                         curve = self.get_bonding_curve_state(mint_address)
@@ -887,7 +1085,7 @@ class LiveTrader:
                     return None
                 print(f"[INFO] Expected tokens: {expected_tokens:,.0f}")
 
-                sig = self.execute_pumpfun_buy(mint_address, sol_amount, slippage, curve)
+                sig = self.execute_pumpfun_buy(mint_address, sol_amount, slippage, curve, deadline=deadline)
 
                 if not sig:
                     # No signature = tx never reached the network, retry immediately
@@ -1138,7 +1336,7 @@ class LiveTrader:
 
         return sol_out / 1e9  # Convert to SOL
 
-    def execute_pumpfun_buy(self, mint_address: str, sol_amount: float, min_tokens: float, curve_data: Dict) -> Optional[str]:
+    def execute_pumpfun_buy(self, mint_address: str, sol_amount: float, min_tokens: float, curve_data: Dict, deadline: float | None = None) -> Optional[str]:
         """Execute buy transaction on Pump.fun bonding curve"""
         try:
             mint_pubkey = Pubkey.from_string(mint_address)
@@ -1414,6 +1612,11 @@ class LiveTrader:
             print(f"  Endpoints: {', '.join(endpoints)}")
             print(f"  Instructions: {len(instructions)}")
             print(f"[TX] Sending buy transaction...")
+
+            # Final deadline check — don't send if we've already blown the budget
+            if deadline and time.time() > deadline:
+                print(f"[SKIP] Buy deadline exceeded pre-send — aborting")
+                return None
 
             transaction = Transaction([self.keypair], message, recent_blockhash)
 

@@ -244,7 +244,7 @@ async def find_token(rpc_url: str) -> dict | None:
 
 
 # ── Main logic ────────────────────────────────────────────────────────────────
-def run_sanity(sol: float, slippage: float, sell_wait: int):
+def run_sanity(sol: float, slippage: float, sell_wait: int, max_buy_ms: int | None = None):
     sep("═")
     print("  PUMP.FUN SANITY TEST — ONE BUY + IMMEDIATE SELL")
     sep("═")
@@ -299,7 +299,8 @@ def run_sanity(sol: float, slippage: float, sell_wait: int):
 
     t0      = time.time()
     buy_sig = trader.buy_token_pumpfun(mint, sol, max_slippage=slippage,
-                                       prefetched_curve=prefetched_curve)
+                                       prefetched_curve=prefetched_curve,
+                                       max_buy_ms=max_buy_ms)
     buy_ms  = (time.time() - t0) * 1000
 
     if not buy_sig:
@@ -364,12 +365,14 @@ def run_sanity(sol: float, slippage: float, sell_wait: int):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="One buy + sell sanity test on a live pump.fun token")
-    ap.add_argument("--sol",      type=float, default=0.002,
+    ap.add_argument("--sol",         type=float, default=0.002,
                     help="SOL to spend (default 0.002)")
-    ap.add_argument("--slippage", type=float, default=0.15,
+    ap.add_argument("--slippage",    type=float, default=0.15,
                     help="Starting slippage 0-1 (default 0.15 = 15%%, escalates on error 6001/6003)")
-    ap.add_argument("--wait",     type=int,   default=5,
+    ap.add_argument("--wait",        type=int,   default=5,
                     help="Seconds to wait after buy before selling (default 5)")
+    ap.add_argument("--max-buy-ms",  type=int,   default=None,
+                    help="Abort buy if not confirmed within this many ms (default: no limit)")
     args = ap.parse_args()
 
-    run_sanity(args.sol, args.slippage, args.wait)
+    run_sanity(args.sol, args.slippage, args.wait, args.max_buy_ms)
