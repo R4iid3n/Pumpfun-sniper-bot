@@ -16,6 +16,7 @@ import json
 import sys
 import time
 import argparse
+import requests
 import websockets
 from solders.pubkey import Pubkey
 from live_trader import LiveTrader
@@ -36,40 +37,69 @@ def err(msg):  print(f"  [ERR]  {msg}")
 def info(msg): print(f"  [---]  {msg}")
 
 
-# ── Helius transactionSubscribe (fastest path) ─────────────────────────────────
-async def find_token_helius(rpc_url: str) -> dict | None:
-    """
-    Detect new pump.fun tokens via Helius Enhanced WebSocket.
+# ── QuikNode logsSubscribe (primary fast path) ────────────────────────────────
+def _fetch_tx_accounts(sig: str, rpc_url: str) -> dict | None:
+    """HTTP getTransaction to extract mint + creator from account keys.
 
-    Uses transactionSubscribe at 'processed' commitment — the notification fires
-    when the validator processes the creation tx, before 2/3 supermajority
-    confirmation (confirmed).  This is ~1 slot (~400ms) faster than pumpportal
-    and 1-4 slots faster than logsSubscribe at confirmed.
-
-    Requires Helius paid plan (atlas-mainnet endpoint).
-    Returns None if the endpoint is unavailable or unsupported.
+    Tries processed first (available immediately on same RPC node that fired
+    the logsNotification), falls back to confirmed if not yet indexed.
     """
-    # atlas-mainnet is Helius's enhanced WS endpoint (paid plans)
-    ws_url = (rpc_url
-              .replace("https://mainnet.helius-rpc.com", "wss://atlas-mainnet.helius-rpc.com")
-              .replace("https://", "wss://")
-              .replace("http://", "ws://"))
+    for commitment in ("processed", "confirmed"):
+        try:
+            r = requests.post(rpc_url, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [sig, {
+                    "encoding": "jsonParsed",
+                    "commitment": commitment,
+                    "maxSupportedTransactionVersion": 0,
+                }],
+            }, timeout=3)
+            result = r.json().get("result")
+            if not result:
+                continue
+
+            account_keys = (result.get("transaction", {})
+                                  .get("message", {})
+                                  .get("accountKeys", []))
+
+            mint    = None
+            creator = None
+            for key_info in account_keys:
+                pubkey = key_info.get("pubkey", "") if isinstance(key_info, dict) else str(key_info)
+                if pubkey.endswith("pump") and mint is None:
+                    mint = pubkey
+                if (isinstance(key_info, dict)
+                        and key_info.get("signer")
+                        and key_info.get("writable")
+                        and not pubkey.endswith("pump")
+                        and creator is None):
+                    creator = pubkey
+
+            if mint:
+                return {"mint": mint, "creator": creator}
+        except Exception:
+            pass
+    return None
+
+
+async def find_token_logs_ws(rpc_url: str) -> dict | None:
+    """
+    Detect new pump.fun tokens via standard Solana logsSubscribe on QuikNode.
+
+    Subscribes at 'processed' commitment — fires in the same slot as token
+    creation, ~400ms before pumpportal.fun re-broadcasts the event.
+    Works with any standard RPC provider (QuikNode, Helius, Triton, etc.).
+    """
+    ws_url = rpc_url.replace("https://", "wss://").replace("http://", "ws://")
 
     sub_msg = json.dumps({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "transactionSubscribe",
+        "method": "logsSubscribe",
         "params": [
-            {
-                "failed": False,
-                "accountInclude": [PUMPFUN_PROGRAM],
-            },
-            {
-                "commitment":                  "processed",
-                "encoding":                    "jsonParsed",
-                "transactionDetails":          "full",
-                "maxSupportedTransactionVersion": 0,
-            },
+            {"mentions": [PUMPFUN_PROGRAM]},
+            {"commitment": "processed"},
         ],
     })
 
@@ -77,63 +107,57 @@ async def find_token_helius(rpc_url: str) -> dict | None:
         async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10,
                                       open_timeout=8) as ws:
             await ws.send(sub_msg)
-            ok("Connected to Helius atlas WebSocket (transactionSubscribe)")
+            ok("Connected to QuikNode WebSocket (logsSubscribe @ processed)")
 
             seen = 0
             while True:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
-                    err("No transactions in 60s")
+                    err("No pump.fun transactions in 60s")
                     return None
 
                 data = json.loads(raw)
 
                 # Subscription confirmation
                 if isinstance(data.get("result"), int):
-                    ok(f"Subscribed at processed commitment (sub_id={data['result']})")
+                    ok(f"Subscribed to pump.fun logs (sub_id={data['result']})")
                     continue
 
-                if data.get("method") != "transactionNotification":
+                if data.get("method") != "logsNotification":
                     continue
 
-                tx_wrap   = data.get("params", {}).get("result", {})
-                tx_full   = tx_wrap.get("transaction", {})
-                meta      = tx_full.get("meta", {})
-                logs      = meta.get("logMessages") or []
+                value = data.get("params", {}).get("result", {}).get("value", {})
 
-                # Must be a pump.fun Create instruction, not a buy/sell
+                # Skip failed transactions
+                if value.get("err") is not None:
+                    continue
+
+                logs = value.get("logs") or []
+
+                # Must be a pump.fun Create, not a buy/sell/other
                 if not any("Instruction: Create" in log for log in logs):
                     continue
 
-                # Extract account keys from the transaction message
-                msg_obj      = tx_full.get("transaction", {}).get("message", {})
-                account_keys = msg_obj.get("accountKeys", [])
+                sig = value.get("signature")
+                if not sig:
+                    continue
 
-                mint    = None
-                creator = None
-                bc_key  = None
+                # Fetch full TX in a thread so we don't block the WS event loop
+                tx_data = await asyncio.to_thread(_fetch_tx_accounts, sig, rpc_url)
+                if not tx_data:
+                    continue
 
-                for key_info in account_keys:
-                    pubkey = key_info.get("pubkey", "") if isinstance(key_info, dict) else str(key_info)
-                    # Pump.fun mints all end with the "pump" suffix
-                    if pubkey.endswith("pump") and mint is None:
-                        mint = pubkey
-                    # Creator = first fee-payer (writable signer, not the mint itself)
-                    if (isinstance(key_info, dict)
-                            and key_info.get("signer")
-                            and key_info.get("writable")
-                            and not pubkey.endswith("pump")
-                            and creator is None):
-                        creator = pubkey
-
+                mint    = tx_data.get("mint")
+                creator = tx_data.get("creator")
                 if not mint:
-                    continue   # Not a token creation we can use
+                    continue
 
                 seen += 1
-                info(f"#{seen:3d}  mint: {mint[:8]}...  (transactionSubscribe @ processed)")
+                info(f"#{seen:3d}  mint: {mint[:8]}...  (logsSubscribe @ processed)")
 
-                # Derive BC PDA locally — no RPC call needed
+                # Derive BC PDA locally — no extra RPC call needed
+                bc_key = ""
                 try:
                     bc_pda_pubkey, _ = Pubkey.find_program_address(
                         [b"bonding-curve", bytes(Pubkey.from_string(mint))],
@@ -141,11 +165,8 @@ async def find_token_helius(rpc_url: str) -> dict | None:
                     )
                     bc_key = str(bc_pda_pubkey)
                 except Exception:
-                    bc_key = ""
+                    pass
 
-                # Build prefetched_curve from protocol-default initial values.
-                # At processed level (same slot as creation), no buys have happened
-                # yet so the initial values are exact.
                 prefetched_curve = None
                 if creator and bc_key:
                     try:
@@ -167,11 +188,11 @@ async def find_token_helius(rpc_url: str) -> dict | None:
                     "name":             mint[:6],
                     "vsr_sol":          30.0,
                     "prefetched_curve": prefetched_curve,
-                    "source":           "helius-transactionSubscribe",
+                    "source":           "logsSubscribe",
                 }
 
     except Exception as e:
-        err(f"Helius atlas WS unavailable ({type(e).__name__}: {e})")
+        err(f"QuikNode logsSubscribe failed ({type(e).__name__}: {e})")
         return None
 
 
@@ -236,10 +257,13 @@ async def find_token_pumpportal() -> dict | None:
             }
 
 
-# ── Top-level find: try Helius first, fall back to pumpportal ─────────────────
+# ── Top-level find: try logsSubscribe first, fall back to pumpportal ──────────
 async def find_token(rpc_url: str) -> dict | None:
     print(f"\n  Waiting for the next new token on pump.fun...")
     print(f"  (press Ctrl+C to abort)\n")
+    result = await find_token_logs_ws(rpc_url)
+    if result:
+        return result
     return await find_token_pumpportal()
 
 

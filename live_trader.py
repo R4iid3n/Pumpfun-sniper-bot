@@ -1125,6 +1125,15 @@ class LiveTrader:
                     # ❌ Bonding curve complete — token graduated to Raydium, not retryable
                     print(f"[BC] Error 6002 — token graduated to Raydium, skipping")
                     return None
+                elif "2006" in err_str and attempt == 1 and prefetched_curve is not None:
+                    # ❌ ConstraintSeeds on first attempt with prefetched curve — we bought
+                    # before the bonding curve account settled on-chain (logsSubscribe fires
+                    # at processed, curve may not be readable yet).  Drop prefetched data,
+                    # wait briefly, and retry with a fresh on-chain curve fetch.
+                    print(f"[WARN] Error 2006 (BC not settled yet) — retrying with fresh curve")
+                    prefetched_curve = None
+                    time.sleep(0.3)
+                    continue
                 else:
                     # ❌ Other on-chain error — not retryable
                     print(f"[ERROR] On-chain failure: {err_str}")
